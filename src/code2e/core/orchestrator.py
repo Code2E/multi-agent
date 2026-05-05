@@ -21,6 +21,7 @@ import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -31,6 +32,8 @@ from pydantic import ValidationError
 from code2e.core.budget import BudgetExceededError, BudgetTracker
 from code2e.core.checkpoint import CheckpointWriter
 from code2e.core.llm_gateway import LlmGateway, RepairExhaustedError
+from code2e.core.port_allocator import PortAllocator, PortUnavailableError
+from code2e.core.process_manager import ProcessManager
 from code2e.core.schemas import (
     AdvisorFeedback,
     AdvisorInput,
@@ -83,6 +86,8 @@ class Orchestrator:
     advisor: "AdvisorAgent | None" = None
     evaluator_testgen: "EvaluatorTestgenAgent | None" = None
     workspace_root: Path | None = None
+    process_manager: ProcessManager | None = None
+    port_allocator: PortAllocator | None = None
     checkpoint: CheckpointWriter | None = None
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
     logger: structlog.stdlib.BoundLogger = field(
@@ -505,16 +510,113 @@ class Orchestrator:
         )
 
     async def _run_launching(self, state: SystemState) -> SystemState:
-        """Phase L: ProcessManager.launch + health-check."""
-        raise NotImplementedError("Orchestrator._run_launching — phase 2 구현 예정")
+        """Phase L: PortAllocator.acquire + ProcessManager.launch + health-check (v4 §6.1, §9).
+
+        실패 라우팅:
+        - launch_spec 없음 → LAUNCH_SPEC_MISSING (Q41).
+        - 의존성 미주입 → INTERNAL_ERROR.
+        - 포트 고갈 → PORT_UNAVAILABLE.
+        - health timeout → 정리 (teardown + port release) 후 LAUNCH_TIMEOUT.
+        - health 통과 직후 process 죽음 → APP_CRASHED.
+
+        성공 시 status='testing', state.launch=LaunchInfo (healthy_at 채움).
+        """
+        if state.plan.launch_spec is None:
+            return self._aborted(
+                state,
+                "LAUNCH_SPEC_MISSING",
+                "Phase L",
+                "plan frontmatter / workspace YAML 모두 launch 블록 없음 (Q41 v1: 휴리스틱 미포함)",
+                "code2e prompt edit planner 3 — round 3 의 launch 블록 가이드 점검",
+            )
+        if self.process_manager is None or self.port_allocator is None:
+            return self._aborted(
+                state,
+                "INTERNAL_ERROR",
+                "Phase L",
+                "process_manager / port_allocator 의존성 미주입",
+                "Orchestrator 인스턴스 생성 시 phase L 인자 모두 전달",
+            )
+
+        spec = state.plan.launch_spec
+
+        # 1) 포트 할당 (kind=http 일 때 의미 있음. cli/worker 는 hint=None 으로 noop 가능).
+        port: int | None = None
+        if spec.kind == "http":
+            try:
+                port = await self.port_allocator.acquire(hint=spec.port_hint)
+            except PortUnavailableError as e:
+                return self._aborted(
+                    state,
+                    "PORT_UNAVAILABLE",
+                    "Phase L",
+                    str(e),
+                    "config.generated_app.port_range 변경",
+                )
+
+        # 2) launch (acquired port 를 spec.port_hint 로 박아 ProcessManager 가 base_url 구성).
+        spec_with_port = spec.model_copy(update={"port_hint": port}) if port is not None else spec
+        info = await self.process_manager.launch(spec_with_port)
+
+        # 3) health check (startup_timeout_s 동안 polling).
+        ok = await self.process_manager.health_check(
+            info, spec.health_check, timeout_s=spec.startup_timeout_s
+        )
+        if not ok:
+            await self.process_manager.teardown(info, grace_s=spec.teardown_grace_s)
+            if port is not None:
+                await self.port_allocator.release(port)
+            return self._aborted(
+                state,
+                "LAUNCH_TIMEOUT",
+                "Phase L",
+                f"산출물이 {spec.startup_timeout_s}s 안에 health check 통과 못함",
+                f"tail {info.log_path}",
+            )
+
+        # 4) health 직후 사망 검사 (race condition: TCP listening 후 즉시 crash).
+        if not await self.process_manager.is_alive(info):
+            if port is not None:
+                await self.port_allocator.release(port)
+            return self._aborted(
+                state,
+                "APP_CRASHED",
+                "Phase L",
+                "health check 직후 산출물 비정상 종료",
+                f"tail {info.log_path}",
+            )
+
+        # 5) healthy_at 업데이트.
+        info = info.model_copy(update={"healthy_at": datetime.now(UTC)})
+
+        return state.model_copy(update={"launch": info, "status": "testing"})
+
+    async def _teardown(self, state: SystemState) -> SystemState:
+        """Phase Teardown: ProcessManager.teardown (SIGTERM grace SIGKILL) + port release.
+
+        v4 §18.3 의 grace 5s. launch_spec.teardown_grace_s 우선.
+        실패해도 phase 결과는 보존 — teardown 자체가 실패해도 next state 는 유지.
+        """
+        info = state.launch
+        if info is None:
+            return state  # nothing to teardown.
+
+        if self.process_manager is not None:
+            grace_s = (
+                state.plan.launch_spec.teardown_grace_s
+                if state.plan.launch_spec is not None
+                else 5
+            )
+            await self.process_manager.teardown(info, grace_s=grace_s)
+
+        if self.port_allocator is not None and info.port is not None:
+            await self.port_allocator.release(info.port)
+
+        return state
 
     async def _run_testing(self, state: SystemState) -> SystemState:
         """Phase 3: Evaluator.testrun ↔ Executor revise loop."""
-        raise NotImplementedError("Orchestrator._run_testing — phase 2 구현 예정")
-
-    async def _teardown(self, state: SystemState) -> SystemState:
-        """SIGTERM (grace 5s) → SIGKILL → port release (v4 §18)."""
-        raise NotImplementedError("Orchestrator._teardown — phase 2 구현 예정")
+        raise NotImplementedError("Orchestrator._run_testing — phase 3 (Playwright) 구현 예정")
 
 
 # --- frontmatter 파싱 utilities ---

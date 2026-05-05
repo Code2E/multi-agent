@@ -152,14 +152,17 @@ def _full_happy_queues() -> dict[str, list[dict[str, object] | Exception]]:
 
 @pytest.mark.asyncio
 async def test_start_runs_phase1_and_phase2_then_aborts_at_launching(tmp_path: Path) -> None:
-    """현재 phase L stub. start() 는 Phase 1+2 통과 후 L 진입 시 INTERNAL_ERROR."""
+    """Phase 1+2 통과 후 Phase L 에서 launch_spec 없음 → LAUNCH_SPEC_MISSING.
+
+    이 테스트는 process_manager / port_allocator 미주입 + Planner R3 mock 응답에
+    launch frontmatter 없는 케이스. Phase L 가 LAUNCH_SPEC_MISSING 으로 abort.
+    """
     orch, _p, _cw = _orchestrator(tmp_path, queues=_full_happy_queues())
     state = await orch.start("build a todo CLI")
 
-    # Phase 1, 2 통과 → Phase L 진입 시 NotImplementedError → _safe_phase 가 INTERNAL_ERROR 로 변환.
     assert state.status == "aborted"
     assert state.termination is not None
-    assert state.termination.reason == "INTERNAL_ERROR"
+    assert state.termination.reason == "LAUNCH_SPEC_MISSING"
     assert state.termination.phase == "Phase L"
     # Phase 1, 2 의 결과가 보존되어야 한다.
     assert len(state.plan.iterations) == 3
@@ -210,10 +213,10 @@ async def test_start_works_without_checkpoint_writer(tmp_path: Path) -> None:
         tmp_path, queues=_full_happy_queues(), with_checkpoint=False
     )
     state = await orch.start("task")
-    # Phase L stub 에서 abort.
+    # Phase L 에서 launch_spec 없음 → LAUNCH_SPEC_MISSING.
     assert state.status == "aborted"
     assert state.termination is not None
-    assert state.termination.reason == "INTERNAL_ERROR"
+    assert state.termination.reason == "LAUNCH_SPEC_MISSING"
 
 
 @pytest.mark.asyncio
