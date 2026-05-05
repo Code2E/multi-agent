@@ -2,52 +2,163 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Code2E Report — {{ run_id }}</title>
+  <title>Code2E Report — {{ state.run_id }}</title>
   <style>
-    body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 2rem; max-width: 980px; }
+    body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 2rem; max-width: 980px; color: #222; }
     h1, h2 { border-bottom: 1px solid #ddd; padding-bottom: .25rem; }
-    section { margin: 2rem 0; }
-    .ok { color: #2c7; }
-    .fail { color: #c33; }
-    pre { background: #f6f8fa; padding: .8rem; overflow-x: auto; }
+    h2 { margin-top: 2rem; }
+    section { margin: 1.5rem 0; }
+    .ok { color: #2c7; font-weight: 600; }
+    .fail { color: #c33; font-weight: 600; }
+    .muted { color: #888; }
+    .badge { display: inline-block; padding: .15rem .5rem; border-radius: 3px; font-size: 85%; font-weight: 600; }
+    .b-ok { background: #d4edda; color: #155724; }
+    .b-fail { background: #f8d7da; color: #721c24; }
+    .b-warn { background: #fff3cd; color: #856404; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #eee; padding: .35rem .5rem; text-align: left; vertical-align: top; font-size: 90%; }
+    th { background: #fafafa; }
+    pre { background: #f6f8fa; padding: .8rem; overflow-x: auto; font-size: 85%; max-height: 24rem; }
+    code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 85%; }
   </style>
 </head>
 <body>
-  <h1>Code2E Run · {{ run_id }}</h1>
+  <h1>Code2E Run · <code>{{ state.run_id }}</code></h1>
 
   <section id="overview">
     <h2>Overview</h2>
-    <p>TODO (phase 2): 종료 사유, 시간, 비용, phase 요약.</p>
+    <table>
+      <tr><th>Status</th><td>
+        {% if state.status == "completed" %}<span class="badge b-ok">{{ state.status }}</span>
+        {% elif state.status == "aborted" %}<span class="badge b-fail">{{ state.status }}</span>
+        {% else %}<span class="badge b-warn">{{ state.status }}</span>{% endif %}
+      </td></tr>
+      <tr><th>User input</th><td><code>{{ state.user_input }}</code></td></tr>
+      <tr><th>Budget</th><td>${{ "%.4f"|format(state.budget.usd_used) }} / ${{ "%.2f"|format(state.budget.limit_usd) }}</td></tr>
+      <tr><th>Tokens</th><td>{{ state.budget.tokens_used }} / {{ state.budget.limit_tokens }}</td></tr>
+    </table>
   </section>
+
+  {% if state.termination %}
+  <section id="termination">
+    <h2>Termination</h2>
+    <p><strong class="fail">{{ state.termination.reason }}</strong> in {{ state.termination.phase }}</p>
+    <p>{{ state.termination.details }}</p>
+    <p class="muted">Next: {{ state.termination.suggested_next }}</p>
+  </section>
+  {% endif %}
 
   <section id="plan">
     <h2>Plan</h2>
-    <p>TODO: v1 / v2 / v3 + units.</p>
+    {% if state.plan.iterations %}
+      <p>{{ state.plan.iterations|length }} round(s){% if state.plan.final %} · final units: {{ state.plan.final.units|length }}{% endif %}</p>
+      {% for plan in state.plan.iterations %}
+        <details>
+          <summary>Round {{ plan.version }}</summary>
+          <pre>{{ plan.content }}</pre>
+        </details>
+      {% endfor %}
+      {% if state.plan.final and state.plan.final.units %}
+        <h3>Units</h3>
+        <table>
+          <tr><th>id</th><th>title</th><th>complexity</th><th>deps</th></tr>
+          {% for u in state.plan.final.units %}
+            <tr>
+              <td><code>{{ u.id }}</code></td>
+              <td>{{ u.title }}</td>
+              <td>{{ u.estimated_complexity }}</td>
+              <td>{{ u.dependencies|join(", ") }}</td>
+            </tr>
+          {% endfor %}
+        </table>
+      {% endif %}
+    {% else %}
+      <p class="muted">No plan iterations.</p>
+    {% endif %}
   </section>
 
   <section id="build">
     <h2>Build</h2>
-    <p>TODO: unit 트리, iteration 별 diff, advisor 코멘트.</p>
+    {% if state.build.units %}
+      <table>
+        <tr><th>unit</th><th>status</th><th>iterations</th><th>force_stop_reason</th></tr>
+        {% for u in state.build.units %}
+          <tr>
+            <td><code>{{ u.unit_id }}</code></td>
+            <td>
+              {% if u.status == "approved" %}<span class="ok">{{ u.status }}</span>
+              {% elif u.status == "force_stopped" %}<span class="fail">{{ u.status }}</span>
+              {% else %}{{ u.status }}{% endif %}
+            </td>
+            <td>{{ u.iteration }}</td>
+            <td>{{ u.force_stop_reason or "" }}</td>
+          </tr>
+        {% endfor %}
+      </table>
+    {% else %}
+      <p class="muted">No build units.</p>
+    {% endif %}
   </section>
 
   <section id="launch">
     <h2>Launch</h2>
-    <p>TODO: 포트 / PID / health check / app 로그 마지막 200줄 (Q48).</p>
+    {% if state.launch %}
+      <table>
+        <tr><th>PID</th><td>{{ state.launch.pid }}</td></tr>
+        <tr><th>Port</th><td>{{ state.launch.port or "—" }}</td></tr>
+        <tr><th>Base URL</th><td>{{ state.launch.base_url or "—" }}</td></tr>
+        <tr><th>Started</th><td>{{ state.launch.started_at }}</td></tr>
+        <tr><th>Healthy</th><td>{{ state.launch.healthy_at or "—" }}</td></tr>
+        <tr><th>Log</th><td><code>{{ state.launch.log_path }}</code></td></tr>
+      </table>
+    {% else %}
+      <p class="muted">No launch info.</p>
+    {% endif %}
   </section>
 
   <section id="tests">
     <h2>Tests</h2>
-    <p>TODO: 케이스, run 결과, 스크린샷, trace.</p>
+    {% if state.test.runs %}
+      <p>{{ state.test.runs|length }} run(s) · status: <strong>{{ state.test.status }}</strong></p>
+      <table>
+        <tr><th>iter</th><th>passed</th><th>failed</th><th>errored</th><th>total</th></tr>
+        {% for r in state.test.runs %}
+          <tr>
+            <td>{{ r.iteration }}</td>
+            <td class="ok">{{ r.summary.passed }}</td>
+            <td class="fail">{{ r.summary.failed }}</td>
+            <td class="fail">{{ r.summary.errored }}</td>
+            <td>{{ r.summary.total }}</td>
+          </tr>
+        {% endfor %}
+      </table>
+      {% set last = state.test.runs[-1] %}
+      {% if last.results %}
+        <h3>Last iteration cases</h3>
+        <table>
+          <tr><th>case_id</th><th>status</th><th>duration_ms</th><th>failure_reason</th></tr>
+          {% for c in last.results %}
+            <tr>
+              <td><code>{{ c.case_id }}</code></td>
+              <td>
+                {% if c.status == "passed" %}<span class="ok">{{ c.status }}</span>
+                {% else %}<span class="fail">{{ c.status }}</span>{% endif %}
+              </td>
+              <td>{{ c.duration_ms }}</td>
+              <td>{{ c.failure_reason or "" }}</td>
+            </tr>
+          {% endfor %}
+        </table>
+      {% endif %}
+    {% else %}
+      <p class="muted">No test runs.</p>
+    {% endif %}
   </section>
 
-  <section id="cost">
-    <h2>Cost</h2>
-    <p>TODO: phase / agent 별 비용 그래프.</p>
-  </section>
-
-  <section id="termination">
-    <h2>Termination</h2>
-    <p>TODO: 어디서 / 왜 멈춘 트리.</p>
+  <section id="meta">
+    <h2>Metadata</h2>
+    <p class="muted">Generated by code2e v{{ code2e_version }} from
+      <code>{{ source_phase }}</code> checkpoint.</p>
   </section>
 </body>
 </html>
