@@ -58,6 +58,8 @@ pythonVersion = "3.12"
 # scaffold 단계: basic. phase 2 에서 strict 로 격상 (v4 §2.3).
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false
+# playwright 는 v1 에서 type stub 미배포 — 모듈 import 자체는 .venv 에 설치됨.
+reportMissingImports = "none"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
