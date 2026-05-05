@@ -17,6 +17,8 @@ dependencies = [
     "anthropic>=0.40",
     "playwright>=1.47",
     "jinja2>=3.1",
+    # YAML 파서 — v4 §3.14 (config/default.yaml) + §13.1 (prompt frontmatter) 모두 YAML.
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
