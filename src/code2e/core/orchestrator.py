@@ -40,31 +40,39 @@ from code2e.core.schemas import (
     BudgetState,
     BuildState,
     EvaluatorTestgenInput,
+    EvaluatorTestrunInput,
     ExecutorInput,
     LaunchSpec,
     Plan,
     PlannerInput,
     PlanUnit,
+    RegressionContext,
     SystemState,
     TerminationInfo,
     TerminationReason,
     TestCase,
+    TestRun,
     UnitState,
 )
 from code2e.core.state import new_run_id
-from code2e.core.termination import decide_force_stop_on_empty_revise, is_stagnant
+from code2e.core.termination import (
+    decide_force_stop_on_empty_revise,
+    is_stagnant,
+    is_test_stagnant,
+)
 from code2e.core.workspace import PathTraversalError, Workspace
 
 if TYPE_CHECKING:
     from code2e.agents.advisor import AdvisorAgent
     from code2e.agents.base import InvocationContext
-    from code2e.agents.evaluator import EvaluatorTestgenAgent
+    from code2e.agents.evaluator import EvaluatorTestgenAgent, EvaluatorTestrunAgent
     from code2e.agents.executor import ExecutorAgent
     from code2e.agents.planner import PlannerAgent
 
 FAILURE_REPORT_HEAD_BYTES = 5 * 1024  # Q39
 FAILURE_REPORT_TAIL_BYTES = 5 * 1024
 PHASE2_MAX_ITERATIONS = 5  # v4 §8.2
+PHASE3_MAX_ITERATIONS = 5  # v4 §8.3
 
 # start() 의 _safe_phase 시그니처용 type alias.
 _PhaseFn = Callable[[SystemState], Awaitable[SystemState]]
@@ -85,6 +93,7 @@ class Orchestrator:
     executor: "ExecutorAgent | None" = None
     advisor: "AdvisorAgent | None" = None
     evaluator_testgen: "EvaluatorTestgenAgent | None" = None
+    evaluator_testrun: "EvaluatorTestrunAgent | None" = None
     workspace_root: Path | None = None
     process_manager: ProcessManager | None = None
     port_allocator: PortAllocator | None = None
@@ -615,8 +624,226 @@ class Orchestrator:
         return state
 
     async def _run_testing(self, state: SystemState) -> SystemState:
-        """Phase 3: Evaluator.testrun ↔ Executor revise loop."""
-        raise NotImplementedError("Orchestrator._run_testing — phase 3 (Playwright) 구현 예정")
+        """Phase 3: Evaluator.testrun ↔ Executor revise loop (v4 §6.1, §8.3).
+
+        흐름 (max PHASE3_MAX_ITERATIONS=5):
+        1. Evaluator.testrun → TestRun (results + signature).
+        2. 모두 pass → status='completed'.
+        3. is_test_stagnant → STAGNATION abort.
+        4. 회귀 감지 (이전 통과 → 현재 실패): regression_context 구성.
+        5. Executor.invoke (test_failure + regression_context) → CodeChange.
+        6. workspace.apply (path traversal → SECURITY_VIOLATION abort).
+        7. ProcessManager.restart (Q42, 항상 재기동) — pm 미주입이면 skip.
+        8. health_check 재검증 — 실패 시 LAUNCH_TIMEOUT abort.
+
+        v4 §8.3 회귀 정책 (ADR-039): auto-rollback OFF — 회귀 정보를 Executor 에
+        전달만 하고 모델이 직접 판단해 수정 (자동 revert 안 함).
+        v4 Q34: v1 은 1 회 실행 (flaky 다수결 v1.1).
+        """
+        if (
+            self.evaluator_testrun is None
+            or self.executor is None
+            or self.workspace_root is None
+        ):
+            return self._aborted(
+                state,
+                "INTERNAL_ERROR",
+                "Phase 3",
+                "evaluator_testrun / executor / workspace_root 의존성 미주입",
+                "Orchestrator 인스턴스 생성 시 phase 3 인자 모두 전달",
+            )
+        if state.test.suite is None:
+            return self._aborted(
+                state,
+                "INTERNAL_ERROR",
+                "Phase 3",
+                "test.suite 없음 (Phase 2 testgen 미완)",
+                "phase 2 완료 확인",
+            )
+        if state.launch is None:
+            return self._aborted(
+                state,
+                "INTERNAL_ERROR",
+                "Phase 3",
+                "launch 정보 없음 (Phase L 미완)",
+                "phase L 완료 확인",
+            )
+
+        workspace = Workspace(root=self.workspace_root / state.run_id)
+        runs: list[TestRun] = []
+        previously_passed: set[str] = set()
+        # 첫 unit 만 단순화 (v1.1 에서 case → unit 매핑 정교화).
+        target_unit = (
+            state.plan.final.units[0]
+            if state.plan.final is not None and state.plan.final.units
+            else None
+        )
+        if target_unit is None:
+            return self._aborted(
+                state,
+                "INTERNAL_ERROR",
+                "Phase 3",
+                "target unit 없음",
+                "Plan units 확인",
+            )
+
+        # launch_info / suite 변수로 narrow 유지 — loop 안 state.model_copy 후에도 타입 추론 안전.
+        launch_info = state.launch
+        suite = state.test.suite
+
+        await self.evaluator_testrun.runner.setup(workspace.root)
+        try:
+            for iteration in range(PHASE3_MAX_ITERATIONS):
+                ctx = self._build_ctx(state.run_id, attempt=iteration, phase="p3")
+
+                # 1) testrun.
+                run = await self.evaluator_testrun.invoke(
+                    EvaluatorTestrunInput(
+                        workspace=str(workspace.root),
+                        suite=suite,
+                        base_url=launch_info.base_url,
+                    ),
+                    ctx,
+                )
+                run = run.model_copy(update={"iteration": iteration + 1})
+                runs.append(run)
+
+                # 2) 모두 pass?
+                if run.summary.failed == 0 and run.summary.errored == 0:
+                    return state.model_copy(
+                        update={
+                            "test": state.test.model_copy(
+                                update={"runs": list(runs), "status": "passed"}
+                            ),
+                            "status": "completed",
+                        }
+                    )
+
+                # 3) stagnation?
+                if is_test_stagnant(runs):
+                    return self._abort_phase3(
+                        state,
+                        runs,
+                        "STAGNATION",
+                        "동일 실패 signature 가 window 회 이상 반복",
+                        "code2e inspect <run_id> 의 test-artifacts 확인",
+                    )
+
+                # 4) 회귀 감지 (ADR-039: 자동 revert 안 함, Executor 에 정보 전달).
+                currently_passed = {
+                    r.case_id for r in run.results if r.status == "passed"
+                }
+                regressed = previously_passed - currently_passed
+                regression_ctx = (
+                    RegressionContext(
+                        previously_passing_case_ids=sorted(regressed),
+                        note="이전에 통과하던 케이스가 현재 실패",
+                    )
+                    if regressed
+                    else None
+                )
+
+                # 5) Executor revise.
+                files = workspace.snapshot()
+                try:
+                    change = await self.executor.invoke(
+                        ExecutorInput(
+                            unit=target_unit,
+                            files=files,
+                            test_failure=run,
+                            regression_context=regression_ctx,
+                        ),
+                        ctx,
+                    )
+                except RepairExhaustedError:
+                    return self._abort_phase3(
+                        state,
+                        runs,
+                        "VALIDATION_FAILURE",
+                        "Executor repair 소진",
+                        "code2e inspect <run_id> 의 agent-outputs/executor 확인",
+                    )
+
+                # 6) workspace 적용.
+                try:
+                    workspace.apply(change.files)
+                except PathTraversalError:
+                    return self._abort_phase3(
+                        state,
+                        runs,
+                        "SECURITY_VIOLATION",
+                        "Phase 3 Executor 가 path traversal 시도",
+                        "executor 프롬프트 강화",
+                    )
+
+                # 7) process restart (Q42 항상 재기동).
+                if self.process_manager is not None and state.plan.launch_spec is not None:
+                    spec = state.plan.launch_spec.model_copy(
+                        update={"port_hint": launch_info.port}
+                    )
+                    new_info = await self.process_manager.restart(spec, launch_info)
+                    ok = await self.process_manager.health_check(
+                        new_info,
+                        spec.health_check,
+                        timeout_s=spec.startup_timeout_s,
+                    )
+                    if not ok:
+                        return self._abort_phase3(
+                            state,
+                            runs,
+                            "LAUNCH_TIMEOUT",
+                            "restart 후 산출물 health 미통과",
+                            f"tail {new_info.log_path}",
+                        )
+                    if not await self.process_manager.is_alive(new_info):
+                        return self._abort_phase3(
+                            state,
+                            runs,
+                            "APP_CRASHED",
+                            "restart 후 산출물 즉시 비정상 종료",
+                            f"tail {new_info.log_path}",
+                        )
+                    new_info = new_info.model_copy(update={"healthy_at": datetime.now(UTC)})
+                    launch_info = new_info
+                    state = state.model_copy(update={"launch": new_info})
+
+                previously_passed = currently_passed
+
+            # max iter 도달.
+            return self._abort_phase3(
+                state,
+                runs,
+                "MAX_ITERATIONS",
+                f"{PHASE3_MAX_ITERATIONS} iter 모두 실패",
+                "code2e prompt edit advisor 또는 max 조정",
+            )
+        finally:
+            await self.evaluator_testrun.runner.teardown()
+
+    def _abort_phase3(
+        self,
+        state: SystemState,
+        runs: list[TestRun],
+        reason: TerminationReason,
+        details: str,
+        suggested_next: str,
+    ) -> SystemState:
+        """Phase 3 의 부분 실행 결과 (test.runs) 보존하면서 abort."""
+        new_test = state.test.model_copy(
+            update={"runs": list(runs), "status": "force_stopped"}
+        )
+        return state.model_copy(
+            update={
+                "test": new_test,
+                "status": "aborted",
+                "termination": TerminationInfo(
+                    reason=reason,
+                    phase="Phase 3",
+                    details=details,
+                    suggested_next=suggested_next,
+                ),
+            }
+        )
 
 
 # --- frontmatter 파싱 utilities ---
