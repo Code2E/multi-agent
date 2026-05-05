@@ -26,7 +26,6 @@ from code2e.core.cassette import CassetteStore
 from code2e.core.llm_gateway import LlmGateway
 from code2e.core.schemas import (
     EvaluatorTestgenInput,
-    EvaluatorTestrunInput,
     Plan,
     PlanMeta,
     PlanUnit,
@@ -221,16 +220,12 @@ async def test_testgen_repair_path_on_invalid_then_success(tmp_path: Path) -> No
     assert len(provider.calls) == 2  # 원본 + repair 1
 
 
-# ---------- testrun stub ----------
+# ---------- testrun ctor (Runner 주입) ----------
 
 
-@pytest.mark.asyncio
-async def test_testrun_still_raises_not_implemented(tmp_path: Path) -> None:
-    """testrun 은 Playwright 통합 시점까지 stub."""
-    agent = EvaluatorTestrunAgent()
-    ctx = _ctx_with(_MockProvider(), tmp_path)
-    with pytest.raises(NotImplementedError):
-        await agent.invoke(
-            EvaluatorTestrunInput(workspace="/tmp/ws", suite=[], base_url=None),
-            ctx,
-        )
+def test_testrun_ctor_requires_runner() -> None:
+    """EvaluatorTestrunAgent 는 Runner 인자 필수 (Step A 부터)."""
+    import pytest as _pytest
+
+    with _pytest.raises(TypeError):
+        EvaluatorTestrunAgent()  # type: ignore[call-arg]  # 의도적: 인자 누락 검증.

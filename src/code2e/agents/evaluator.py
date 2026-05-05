@@ -27,6 +27,8 @@ from code2e.core.schemas import (
     TestCase,
     TestRun,
 )
+from code2e.core.termination import signature_fn
+from code2e.runners.base import TestRunner
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
@@ -95,13 +97,28 @@ class EvaluatorTestgenAgent:
 
 
 class EvaluatorTestrunAgent:
+    """testrun 모드. Runner Protocol 에 위임 + signature 자동 생성 (v4 §8.3).
+
+    DECISION:
+    - Q34: v1 은 1 회 실행 (multiple-of-N 다수결은 v1.1).
+    - signature: case_id + status + failure_reason 해시 — Phase 3 stagnation 비교용.
+
+    Runner 의 setup / teardown 은 호출자(Phase 3 loop) 책임 — 매 invoke 마다 브라우저
+    재시작은 비효율. invoke 는 .run 만 호출.
+    """
+
     name: ClassVar[str] = "evaluator.testrun"
     version: ClassVar[str] = "1.0"
     InputModel: ClassVar[type[EvaluatorTestrunInput]] = EvaluatorTestrunInput
     OutputModel: ClassVar[type[TestRun]] = TestRun
 
+    def __init__(self, runner: TestRunner) -> None:
+        self.runner = runner
+
     async def invoke(self, inp: EvaluatorTestrunInput, ctx: InvocationContext) -> TestRun:
-        # Playwright runner 통합은 별도 commit. PlaywrightRunner.run 위임 + retry.
-        raise NotImplementedError(
-            "EvaluatorTestrunAgent.invoke — v4 §6.1 Playwright 위임 구현 예정 (별도 commit)"
+        run = await self.runner.run(inp.suite, ctx, base_url=inp.base_url)
+        sig_payload = "|".join(
+            f"{r.case_id}:{r.status}:{r.failure_reason or ''}" for r in run.results
         )
+        signature = signature_fn(sig_payload) if sig_payload else "empty"
+        return run.model_copy(update={"signature": signature})
