@@ -160,6 +160,9 @@ class LaunchInfo(BaseModel):
 
 
 class TestCase(BaseModel):
+    # pytest 가 'Test*' prefix 클래스를 자동 collect 하지 않도록.
+    __test__ = False
+
     id: str  # e.g., "T-001"
     scenario: str
     given: str
@@ -170,6 +173,8 @@ class TestCase(BaseModel):
 
 
 class TestResult(BaseModel):
+    __test__ = False
+
     case_id: str
     status: Literal["passed", "failed", "errored", "skipped"]
     duration_ms: int
@@ -178,6 +183,8 @@ class TestResult(BaseModel):
 
 
 class TestSummary(BaseModel):
+    __test__ = False
+
     passed: int
     failed: int
     errored: int
@@ -185,6 +192,8 @@ class TestSummary(BaseModel):
 
 
 class TestRun(BaseModel):
+    __test__ = False
+
     iteration: int
     results: list[TestResult]
     summary: TestSummary
@@ -230,6 +239,8 @@ class BuildState(BaseModel):
 
 
 class TestState(BaseModel):
+    __test__ = False
+
     suite: list[TestCase] | None = None
     runs: list[TestRun] = Field(default_factory=list)
     status: Literal["pending", "passed", "failed", "force_stopped"] = "pending"
