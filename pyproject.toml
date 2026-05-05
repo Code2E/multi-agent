@@ -1,0 +1,62 @@
+[project]
+name = "code2e"
+version = "0.1.0"
+description = "Multi-agent code generation CLI (localhost-only). Planner / Executor / Advisor / Evaluator over a 3-phase loop."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "hykjun" }]
+
+dependencies = [
+    "pydantic>=2,<3",
+    "pydantic-settings>=2",
+    "typer>=0.12",
+    "rich>=13",
+    "structlog>=24",
+    "httpx>=0.27",
+    "anthropic>=0.40",
+    "playwright>=1.47",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "coverage>=7",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+]
+optional = ["anyio>=4"]
+
+[project.scripts]
+code2e = "code2e.cli.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/code2e"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N"]
+# E501: line length handled by formatter.
+# B008: Typer requires call-in-default for Option/Argument metadata.
+# UP037: TYPE_CHECKING string annotations are intentional (forward refs across modules).
+ignore = ["E501", "B008", "UP037"]
+
+[tool.pyright]
+include = ["src/code2e"]
+pythonVersion = "3.12"
+# scaffold 단계: basic. phase 2 에서 strict 로 격상 (v4 §2.3).
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

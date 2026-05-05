@@ -1,0 +1,27 @@
+# venv / build
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# bytecode
+__pycache__/
+*.pyc
+
+# secrets
+.env
+
+# tool caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# project runtime artifacts (gitignored, generated per run)
+runs/
+cassettes/
+
+# OS
+.DS_Store

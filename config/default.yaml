@@ -1,0 +1,78 @@
+# Code2E default config (v4 §3.14).
+# Override priority: CLI > env (CODE2E_*) > this file > code defaults.
+
+loops:
+  planning:
+    iterations: 3
+  feedback:
+    max_iterations: 5
+    stagnation_window: 2
+    similarity_threshold: 0.92
+  test:
+    max_iterations: 5
+    stagnation_window: 2
+    auto_rollback_on_regression: false   # ADR-039: OFF
+
+agents:
+  planner:
+    model: "claude-sonnet-4-6"
+    temperature:
+      round1: 0.7
+      round2: 0.3
+      round3: 0.3
+  executor:
+    model: "claude-sonnet-4-6"
+    temperature: 0.2
+  advisor:
+    model: "claude-sonnet-4-6"
+    temperature: 0.3
+  evaluator:
+    model: "claude-sonnet-4-6"
+    temperature: 0.2
+
+llm:
+  retry:
+    max: 3
+    base_ms: 1000
+    jitter: true
+  timeout_ms: 90000
+  repair:
+    max_attempts: 2                      # ADR-043
+
+budget:
+  max_total_usd: 5.0
+  max_total_tokens: 1000000
+  warn_threshold: 0.8
+
+cassettes:
+  mode: auto                             # off | record | replay | auto
+  dir: ./cassettes
+  redact_secrets: true
+
+cli:
+  output_tty: pretty
+  output_non_tty: jsonl
+  colors: auto
+
+hooks:
+  dir: ./hooks
+  enabled: true
+
+reports:
+  dir: ./runs/{run_id}/report
+  open_after: false
+
+generated_app:
+  port_range: [3000, 3999]
+  startup_timeout_s: 30
+  health_check:
+    method: HTTP_GET                     # Q47: HTTP_GET + TCP_CONNECT v1
+    path: /
+    expected_status: [200, 301, 302, 404]
+  teardown_grace_s: 5
+
+security:
+  workspace_root: ./runs/{run_id}/workspace
+  forbidden_paths: ["..", "/", "~"]
+  redact_secrets: true
+  allow_network: localhost
