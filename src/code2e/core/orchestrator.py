@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -28,10 +29,12 @@ import yaml
 from pydantic import ValidationError
 
 from code2e.core.budget import BudgetExceededError, BudgetTracker
+from code2e.core.checkpoint import CheckpointWriter
 from code2e.core.llm_gateway import LlmGateway, RepairExhaustedError
 from code2e.core.schemas import (
     AdvisorFeedback,
     AdvisorInput,
+    BudgetState,
     BuildState,
     EvaluatorTestgenInput,
     ExecutorInput,
@@ -45,6 +48,7 @@ from code2e.core.schemas import (
     TestCase,
     UnitState,
 )
+from code2e.core.state import new_run_id
 from code2e.core.termination import decide_force_stop_on_empty_revise, is_stagnant
 from code2e.core.workspace import PathTraversalError, Workspace
 
@@ -58,6 +62,9 @@ if TYPE_CHECKING:
 FAILURE_REPORT_HEAD_BYTES = 5 * 1024  # Q39
 FAILURE_REPORT_TAIL_BYTES = 5 * 1024
 PHASE2_MAX_ITERATIONS = 5  # v4 §8.2
+
+# start() 의 _safe_phase 시그니처용 type alias.
+_PhaseFn = Callable[[SystemState], Awaitable[SystemState]]
 
 
 @dataclass
@@ -76,13 +83,87 @@ class Orchestrator:
     advisor: "AdvisorAgent | None" = None
     evaluator_testgen: "EvaluatorTestgenAgent | None" = None
     workspace_root: Path | None = None
+    checkpoint: CheckpointWriter | None = None
     cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
     logger: structlog.stdlib.BoundLogger = field(
         default_factory=lambda: structlog.get_logger("orchestrator")
     )
 
-    async def start(self, user_input: str) -> SystemState:
-        raise NotImplementedError("Orchestrator.start — phase 2 구현 예정 (v4 §6.1)")
+    async def start(self, user_input: str, run_id: str | None = None) -> SystemState:
+        """파이프라인 entry point. Phase 1 → 2 → L → 3 → Teardown 순차 실행.
+
+        - 매 phase 종료 후 checkpoint 저장 (있으면).
+        - status='aborted' 면 즉시 return — 다음 phase 진입 안 함.
+        - 현재 Phase L / 3 / Teardown 은 stub (NotImplementedError) — 진입 시
+          INTERNAL_ERROR 로 우아하게 abort. 별도 commit 으로 구현 예정.
+        """
+        rid = run_id or new_run_id()
+        state = SystemState(
+            run_id=rid,
+            status="planning",
+            user_input=user_input,
+            budget=BudgetState(
+                limit_usd=self.budget.limit_usd,
+                limit_tokens=self.budget.limit_tokens,
+            ),
+        )
+
+        # Phase 1.
+        state = await self._run_planning(state)
+        self._save_checkpoint(state, "planning")
+        if state.status == "aborted":
+            return state
+
+        # Phase 2.
+        state = await self._run_building_and_testgen(state)
+        self._save_checkpoint(state, "building")
+        if state.status == "aborted":
+            return state
+
+        # Phase L (stub — 별도 commit).
+        state = await self._safe_phase(state, self._run_launching, "Phase L")
+        self._save_checkpoint(state, "launching")
+        if state.status == "aborted":
+            return state
+
+        # Phase 3 (stub).
+        state = await self._safe_phase(state, self._run_testing, "Phase 3")
+        self._save_checkpoint(state, "testing")
+        if state.status == "aborted":
+            return state
+
+        # Teardown (stub).
+        state = await self._safe_phase(state, self._teardown, "Teardown")
+        self._save_checkpoint(state, "teardown")
+        if state.status == "aborted":
+            return state
+
+        final_state = state.model_copy(update={"status": "completed"})
+        self._save_checkpoint(final_state, "completed")
+        return final_state
+
+    async def _safe_phase(
+        self,
+        state: SystemState,
+        phase_fn: "_PhaseFn",
+        phase_label: str,
+    ) -> SystemState:
+        """phase 메서드가 NotImplementedError 면 INTERNAL_ERROR 로 우아하게 abort."""
+        try:
+            return await phase_fn(state)
+        except NotImplementedError as e:
+            return self._aborted(
+                state,
+                "INTERNAL_ERROR",
+                phase_label,
+                f"{phase_label} 미구현: {e}",
+                "별도 commit 의 process_manager / playwright_runner 구현 후 재시도",
+            )
+
+    def _save_checkpoint(self, state: SystemState, phase: str) -> None:
+        """checkpoint writer 가 있으면 디스크 저장. 없으면 noop."""
+        if self.checkpoint is not None:
+            self.checkpoint.save(state, phase)
 
     async def _run_planning(self, state: SystemState) -> SystemState:
         """Phase 1: 3-round Planner.
