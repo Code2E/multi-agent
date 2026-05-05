@@ -67,26 +67,88 @@ type: `feat` / `task` / `fix` / `docs` / `refactor` / `test` / `chore`
 ### Rule #0 — 작업 전 핵심 문서 정독
 v4 plan + 본 파일을 먼저 읽고 컨텍스트를 잡은 뒤 진행한다. 결정의 정량 근거가 필요하면 §19.2/§19.3 결정 표를 참조.
 
-### Rule #1 — Surgical / Simplicity / Goal-Driven (hykjun_claude.md Rule #1 와 동일 정신)
-- 가정은 명시화. 모호하면 멈추고 질문.
-- 요청 외 기능 / 추측성 추상화 / 발생 불가 시나리오의 에러 핸들링 모두 금지.
-- 통제 영역(아래) 은 절대 임의 변경 금지.
+> **Tradeoff:** 아래 규칙들은 속도보다 신중함 쪽으로 편향. 본 프로젝트는 통제 영역(4 에이전트 고정 / localhost 전용 / cassette schema 안정성 / 결정값) 이 많아 `improve` 가 곧 회귀가 되기 쉬움. 사소한 작업은 융통성 있게.
 
-### 통제 영역 (변경 시 ADR 또는 결정 갱신 필요)
-- 4 에이전트 고정 (ADR-040). 5번째 에이전트 추가 비목표.
-- localhost 전용 (ADR-041). 컨테이너 / 배포 / CI 비목표.
-- Repair 2회 (ADR-043), auto-rollback OFF (ADR-039), Planner 3회 (FR-002).
-- §19.2 / §19.3 의 결정값 (stagnation 0.92, max iter 5, port range 3000-3999, teardown grace 5s, ...).
-- Pydantic 모델 (Part VII) 의 필드 추가 시 `schema_version` bump + 마이그레이션.
+### Rule #1 — Think Before Coding (가정 금지, 혼란 표면화)
 
-### 검증 골든 4종
-구현 후 다음이 모두 통과해야 머지:
+구현 전:
+
+- 가정은 **명시적으로** 말한다. 불확실하면 묻는다.
+- 해석이 여러 갈래면 모두 제시한다 — 혼자 골라 가지 않는다.
+- 더 단순한 접근이 있으면 말한다. 필요하면 push back.
+- 모호하면 멈추고, 무엇이 헷갈리는지 명명하고 질문한다.
+
+본 프로젝트 특수 케이스:
+
+- v4 plan / §19.2 / §19.3 의 결정과 어긋나 보이는 요청이면 **plan 파일과의 차이를 표면화** 하고 어느 쪽이 의도인지 묻는다.
+- ADR 번호가 걸린 결정(ADR-039 / 040 / 041 / 043) 은 절대 가정으로 우회하지 않는다.
+
+### Rule #2 — Simplicity First (최소 코드)
+
+- 요청 외 기능 / 추측성 추상화 / 요청되지 않은 유연성·설정 가능성 모두 금지.
+- 단발 호출 코드를 위한 추상화 금지.
+- 발생할 수 없는 시나리오의 에러 핸들링 금지.
+- 200 줄로 쓴 게 50 줄로 가능하면 다시 쓴다.
+- 자문: *"시니어 엔지니어가 보면 over-engineered 라고 할까?"* 그렇다면 단순화.
+
+본 프로젝트 특수 케이스:
+
+- v4 NG (비목표) 영역 — 컨테이너 / 배포 / CI / 5번째 에이전트 / 자율 협업 / 다중 사용자 — 제안하지도, 미리 hook 도 만들지 않는다.
+- v1.1 로 미뤄진 항목 (worker kind / cheaper 강등 / flaky 다수결 / STDOUT_MATCH+FILE_EXISTS / 휴리스틱 LaunchSpec / stdin pipe) 은 v1 에서 손대지 않는다.
+- `config/default.yaml` 에 새 옵션 추가 시 §19.2/19.3 같은 결정 근거 없이는 추가하지 않는다.
+
+### Rule #3 — Surgical Changes (외과적 변경)
+
+기존 코드 편집 시:
+
+- 인접 코드 / 주석 / 포맷팅을 "improve" 하지 않는다. 깨지지 않은 것 리팩토링 금지.
+- 기존 스타일 유지 (본인이라면 다르게 했더라도).
+- 무관한 dead code 는 **언급만** 하고 삭제 금지.
+- 본인 변경으로 고아가 된 import / 변수 / 함수만 제거.
+- 기준: **변경된 모든 줄이 사용자 요청과 직접 연결**되어야 함.
+
+⚠️ **본 프로젝트 통제 영역 — 절대 "improve" 대상 아님:**
+
+- 4 에이전트 고정 (ADR-040). 5번째 추가 / Hook 으로 우회 모두 금지.
+- localhost 전용 (ADR-041). 컨테이너화 / 원격 호출 / CI 통합 시도 금지.
+- Repair 2회 (ADR-043), auto-rollback OFF (ADR-039), Planner 3회 (FR-002), Phase 2/3 max 5 회.
+- §19.2 / §19.3 결정값 (stagnation 0.92, port_range 3000-3999, teardown_grace 5s, signature 동일성 비교 등).
+- Pydantic 모델 (Part VII) 의 필드 추가 / 변경 시 `schema_version` bump + 마이그레이션 필수.
+- 프롬프트 frontmatter `version` 변경 시 cassette 키가 자동 invalidate (§13.5) — 의도한 경우에만.
+- Agent 의 InputModel / OutputModel / ClassVar (name / version / temperature) 는 cassette 키 직결. 변경은 새 ADR 동반.
+
+### Rule #4 — Goal-Driven Execution (목표 기반 실행)
+
+작업을 검증 가능한 형태로 변환한다:
+
+- "validation 추가" → "잘못된 입력 테스트 작성 → 통과시키기"
+- "버그 수정" → "재현 테스트 작성 → 통과시키기"
+- "X 리팩토링" → "전·후 동일하게 테스트 통과"
+
+다단계 작업은 짧은 plan 을 명시한다 (예: `1. X → 검증: Y / 2. A → 검증: B`). TodoWrite 도 같은 목적.
+
+본 프로젝트 검증 골든 4종 — 모든 PR 은 다음이 통과해야 머지:
 ```bash
 .venv/bin/python -m ruff check src/code2e tests
 .venv/bin/python -m pyright src/code2e         # phase 2 부터 strict 격상
 .venv/bin/python -m pytest -q
 .venv/bin/python -m code2e --help
 ```
+
+본 프로젝트 추가 검증:
+
+- 프롬프트 변경 → `code2e prompt test <agent> --replay --assert-snapshot` 골든 비교 (§13.4, phase 2 이후).
+- `core/schemas.py` 변경 → `schema_version` bump + 기존 cassette / state.json 마이그레이션 함수.
+- `core/llm_gateway.py` / `cassette.py` 변경 → cassette key 정규화 식 회귀 테스트.
+
+---
+
+### 적용 신호 (가이드라인이 작동 중인지)
+
+- diff 에 불필요한 변경이 줄어든다.
+- 과설계로 인한 재작성이 줄어든다.
+- 실수 후가 아니라 구현 전에 명확화 질문이 나온다.
+- 통제 영역 위반이 PR 단계가 아니라 사고 단계에서 잡힌다.
 
 ---
 
