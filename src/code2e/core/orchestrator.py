@@ -17,19 +17,30 @@ DECISION: Q39 — 실패 리포트 raw + 길면 헤드/테일 5KB 씩 컷 (10KB 
 
 from __future__ import annotations
 
+import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal, cast
 
+import structlog
 import yaml
 from pydantic import ValidationError
 
+from code2e.core.budget import BudgetExceededError, BudgetTracker
+from code2e.core.llm_gateway import LlmGateway, RepairExhaustedError
 from code2e.core.schemas import (
     LaunchSpec,
     Plan,
+    PlannerInput,
     PlanUnit,
     SystemState,
+    TerminationInfo,
     TerminationReason,
 )
+
+if TYPE_CHECKING:
+    from code2e.agents.base import InvocationContext
+    from code2e.agents.planner import PlannerAgent
 
 FAILURE_REPORT_HEAD_BYTES = 5 * 1024  # Q39
 FAILURE_REPORT_TAIL_BYTES = 5 * 1024
@@ -39,12 +50,133 @@ FAILURE_REPORT_TAIL_BYTES = 5 * 1024
 class Orchestrator:
     """파이프라인 진입점. start() 호출 1회 = 1 run."""
 
+    planner: "PlannerAgent"
+    llm_gateway: LlmGateway
+    budget: BudgetTracker
+    cancel_token: asyncio.Event = field(default_factory=asyncio.Event)
+    logger: structlog.stdlib.BoundLogger = field(
+        default_factory=lambda: structlog.get_logger("orchestrator")
+    )
+
     async def start(self, user_input: str) -> SystemState:
         raise NotImplementedError("Orchestrator.start — phase 2 구현 예정 (v4 §6.1)")
 
     async def _run_planning(self, state: SystemState) -> SystemState:
-        """Phase 1: 3-round Planner."""
-        raise NotImplementedError("Orchestrator._run_planning — phase 2 구현 예정")
+        """Phase 1: 3-round Planner.
+
+        각 round 후 state.plan.iterations 누적. round 3 후 final + units (validate_dag
+        통과) + launch_spec (frontmatter `launch:` 있으면) 채움. status='building' 으로
+        전이. 실패 시 _aborted() 로 status='aborted' + TerminationInfo.
+        """
+        plans: list[Plan] = list(state.plan.iterations)
+        new_state = state
+
+        for round_no in (1, 2, 3):
+            prev_plan = plans[-1] if plans else None
+            inp = PlannerInput(
+                user_input=state.user_input,
+                prev_plan=prev_plan,
+                round=cast(Literal[1, 2, 3], round_no),
+            )
+            ctx = self._build_ctx(state.run_id, attempt=round_no - 1)
+            try:
+                plan = await self.planner.invoke(inp, ctx)
+            except RepairExhaustedError as e:
+                return self._aborted(
+                    new_state,
+                    "VALIDATION_FAILURE",
+                    "Phase 1",
+                    f"round {round_no}: {e}",
+                    "code2e inspect <run_id> 의 agent-outputs/planner 확인",
+                )
+            except BudgetExceededError as e:
+                return self._aborted(
+                    new_state,
+                    "BUDGET_EXCEEDED",
+                    "Phase 1",
+                    f"round {round_no}: {e}",
+                    "config.budget 조정 또는 cassette mode=replay 사용",
+                )
+            except asyncio.CancelledError:
+                return self._aborted(
+                    new_state,
+                    "CANCELLED",
+                    "Phase 1",
+                    f"round {round_no} 진행 중 취소됨",
+                    "code2e run --resume <run_id> 로 재개",
+                )
+
+            plans.append(plan)
+            new_state = new_state.model_copy(
+                update={"plan": new_state.plan.model_copy(update={"iterations": list(plans)})}
+            )
+
+        # round 3 결과 검증.
+        final = plans[-1]
+        units = list(final.units)
+        if not units:
+            # Q4: frontmatter 또는 본문 정규식 fallback.
+            units = parse_units_from_plan(final.content)
+        if not units:
+            return self._aborted(
+                new_state,
+                "UNIT_DECOMPOSITION_FAILED",
+                "Phase 1",
+                "round 3 결과에 units 없음 (frontmatter / 본문 정규식 모두 실패)",
+                "round 3 프롬프트 점검: code2e prompt edit planner 3",
+            )
+
+        ok, _reason = validate_unit_dag(units)
+        if not ok:
+            return self._aborted(
+                new_state,
+                "UNIT_DECOMPOSITION_FAILED",
+                "Phase 1",
+                "DAG 검증 실패 (순환 / dangling reference / duplicate id)",
+                "round 3 프롬프트 점검 — DAG 규칙 명시 강화",
+            )
+
+        if final.units != units:
+            final = final.model_copy(update={"units": units})
+
+        launch_spec = extract_launch_spec_from_plan(final)
+
+        new_plan_state = new_state.plan.model_copy(
+            update={"iterations": list(plans), "final": final, "launch_spec": launch_spec}
+        )
+        return new_state.model_copy(update={"plan": new_plan_state, "status": "building"})
+
+    def _build_ctx(self, run_id: str, attempt: int) -> "InvocationContext":
+        from code2e.agents.base import InvocationContext  # noqa: PLC0415
+
+        return InvocationContext(
+            trace_id=f"{run_id}-p1-r{attempt}",
+            attempt=attempt,
+            budget=self.budget,
+            cancel_token=self.cancel_token,
+            logger=self.logger,
+            llm=self.llm_gateway,
+        )
+
+    def _aborted(
+        self,
+        state: SystemState,
+        reason: TerminationReason,
+        phase: str,
+        details: str,
+        suggested_next: str,
+    ) -> SystemState:
+        return state.model_copy(
+            update={
+                "status": "aborted",
+                "termination": TerminationInfo(
+                    reason=reason,
+                    phase=phase,
+                    details=details,
+                    suggested_next=suggested_next,
+                ),
+            }
+        )
 
     async def _run_building_and_testgen(self, state: SystemState) -> SystemState:
         """Phase 2: TaskGroup(Build, Evaluator.testgen) (v4 §3.8)."""
