@@ -563,9 +563,16 @@ class Orchestrator:
                     "config.generated_app.port_range 변경",
                 )
 
-        # 2) launch (acquired port 를 spec.port_hint 로 박아 ProcessManager 가 base_url 구성).
-        spec_with_port = spec.model_copy(update={"port_hint": port}) if port is not None else spec
-        info = await self.process_manager.launch(spec_with_port)
+        # 2) launch: cwd 를 workspace 로 주입 (LLM 은 run_id 를 모르므로 직접 작성 불가).
+        #    + acquired port 를 port_hint + PORT env 로 박아 ProcessManager / 산출 앱 공유.
+        workspace_dir = (self.workspace_root or Path(".")) / state.run_id
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        spec_overrides: dict[str, object] = {"cwd": str(workspace_dir)}
+        if port is not None:
+            spec_overrides["port_hint"] = port
+            spec_overrides["env"] = {**spec.env, "PORT": str(port)}
+        spec_with_overrides = spec.model_copy(update=spec_overrides)
+        info = await self.process_manager.launch(spec_with_overrides)
 
         # 3) health check (startup_timeout_s 동안 polling).
         ok = await self.process_manager.health_check(

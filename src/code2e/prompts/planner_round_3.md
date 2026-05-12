@@ -17,7 +17,7 @@ output_schema: PlannerLlmOutput
 
 1. `content` (string): 최종 plan 의 markdown 본문. 산출물이 HTTP 서버 / CLI / worker 인 경우, 본문 시작에 YAML frontmatter 로 launch 블록을 포함하세요:
 
-   ```
+   ```yaml
    ---
    launch:
      kind: http       # http | cli | worker
@@ -32,6 +32,14 @@ output_schema: PlannerLlmOutput
    ```
 
    v1 은 health_check.method 가 HTTP_GET 또는 TCP_CONNECT 만 지원합니다.
+
+   **포트 처리 (kind=http 일 때 매우 중요)**:
+   - Orchestrator 가 사용 가능한 포트를 자동 할당하고 `PORT` 환경변수로 주입합니다.
+   - `command` 에 포트를 절대 하드코딩하지 마세요 (예: `--port 8000` 금지).
+   - 산출 코드는 반드시 `os.environ["PORT"]` 또는 `os.environ.get("PORT", "8000")` 로 포트를 읽어야 합니다.
+   - 예시 command: `["python", "main.py"]` (앱 내부에서 PORT env 읽음) 또는
+     `["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]` (셸 치환).
+   - 각 unit 의 acceptance_criteria 에 "PORT 환경변수로 포트를 받는다" 같은 기준을 포함하세요.
 
 2. `units` (array, **반드시 1개 이상**):
    - `id`: "U-001" / "U-002" 형식 (3자리 zero-padded, 1부터).
