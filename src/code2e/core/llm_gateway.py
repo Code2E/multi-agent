@@ -222,7 +222,7 @@ class LlmGateway:
     provider: LlmProvider
     cassette: CassetteStore
     budget: BudgetTracker
-    max_tokens: int = 4096
+    max_tokens: int = 8192
 
     async def call(
         self,
