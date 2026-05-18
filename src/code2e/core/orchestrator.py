@@ -275,6 +275,23 @@ class Orchestrator:
 
         launch_spec = extract_launch_spec_from_plan(final)
 
+        # HTTP 산출물로 보이는데 launch_spec 누락 → Phase L 까지 가지 말고 즉시 abort.
+        # 휴리스틱: 사용자 입력에 HTTP 신호 단어 (api / server / endpoint / 등) 포함
+        # AND round 3 frontmatter 에 launch 블록 없음. v4 Q41 (휴리스틱 추론 미포함)
+        # 원칙은 유지 — 우리는 *생성* 휴리스틱이 아니라 *진단* 휴리스틱만 사용.
+        if launch_spec is None and _looks_like_http_task(state.user_input):
+            return self._aborted(
+                new_state.model_copy(
+                    update={"plan": new_state.plan.model_copy(update={"final": final})}
+                ),
+                "LAUNCH_SPEC_MISSING",
+                "Phase 1",
+                "user_input 이 HTTP 산출물로 보이는데 round 3 plan frontmatter 에 "
+                "launch 블록이 없음. Phase L 에서 어차피 abort 됨.",
+                "round 3 프롬프트의 launch frontmatter 가이드 확인. "
+                "또는 task 표현을 더 명시적으로 (예: 'with REST API endpoints').",
+            )
+
         new_plan_state = new_state.plan.model_copy(
             update={"iterations": list(plans), "final": final, "launch_spec": launch_spec}
         )
@@ -912,6 +929,23 @@ def _extract_frontmatter(text: str) -> str | None:
     """문서 처음의 YAML frontmatter 본문 (`---` 사이) 반환. 없으면 None."""
     m = _FRONTMATTER_RE.match(text)
     return m.group(1) if m else None
+
+
+_HTTP_TASK_KEYWORDS = re.compile(
+    r"\b(api|rest|server|endpoint|http|fastapi|flask|django|uvicorn|"
+    r"webhook|microservice|backend|/health|/todos|GET\s|POST\s|PUT\s|DELETE\s)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_http_task(user_input: str) -> bool:
+    """task 가 HTTP 산출물을 요구하는지 추정.
+
+    *생성* 휴리스틱 (LaunchSpec 추론) 이 아니라 *진단* 휴리스틱 (launch_spec 누락이
+    실수인지 의도인지 판별). Q41 의 비목표 영역과 충돌하지 않음.
+    false positive 는 가능하지만 false negative 는 피하도록 키워드 넉넉히 잡음.
+    """
+    return bool(_HTTP_TASK_KEYWORDS.search(user_input))
 
 
 def _tail_log(log_path: str, n: int = 15) -> str:
