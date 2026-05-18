@@ -1,0 +1,10 @@
+# 의존성 정의의 single source of truth 는 pyproject.toml 입니다.
+# 이 파일은 표준 `pip install -r requirements.txt` 호환 진입점일 뿐이며,
+# 실제 패키지 목록은 pyproject.toml 의 [project.dependencies] 및
+# [project.optional-dependencies] 에 정의돼 있습니다.
+#
+# 권장: ./scripts/setup-dev.sh (venv 생성 + install + .env 안내까지 자동)
+# 수동: pip install -e ".[dev,demo]"
+# 호환: pip install -r requirements.txt   (← 이 파일이 처리)
+
+-e .[dev,demo]

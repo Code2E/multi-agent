@@ -30,6 +30,12 @@ dev = [
     "pyright>=1.1.380",
 ]
 optional = ["anyio>=4"]
+# 산출 앱이 흔히 import 하는 런타임 패키지. v1 은 deps install 단계가 없으므로
+# code2e venv 에 미리 포함해 산출물 실행을 보장 (학부 시연용 trade-off).
+demo = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
+]
 
 [project.scripts]
 code2e = "code2e.cli.app:main"
