@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -124,36 +125,36 @@ class Orchestrator:
 
         # Phase 1.
         state = await self._run_planning(state)
-        self._save_checkpoint(state, "planning")
+        state = self._save_checkpoint(state, "planning")
         if state.status == "aborted":
             return state
 
         # Phase 2.
         state = await self._run_building_and_testgen(state)
-        self._save_checkpoint(state, "building")
+        state = self._save_checkpoint(state, "building")
         if state.status == "aborted":
             return state
 
         # Phase L (stub — 별도 commit).
         state = await self._safe_phase(state, self._run_launching, "Phase L")
-        self._save_checkpoint(state, "launching")
+        state = self._save_checkpoint(state, "launching")
         if state.status == "aborted":
             return state
 
         # Phase 3 (stub).
         state = await self._safe_phase(state, self._run_testing, "Phase 3")
-        self._save_checkpoint(state, "testing")
+        state = self._save_checkpoint(state, "testing")
         if state.status == "aborted":
             return state
 
         # Teardown (stub).
         state = await self._safe_phase(state, self._teardown, "Teardown")
-        self._save_checkpoint(state, "teardown")
+        state = self._save_checkpoint(state, "teardown")
         if state.status == "aborted":
             return state
 
         final_state = state.model_copy(update={"status": "completed"})
-        self._save_checkpoint(final_state, "completed")
+        final_state = self._save_checkpoint(final_state, "completed")
         return final_state
 
     async def _safe_phase(
@@ -174,10 +175,25 @@ class Orchestrator:
                 "별도 commit 의 process_manager / playwright_runner 구현 후 재시도",
             )
 
-    def _save_checkpoint(self, state: SystemState, phase: str) -> None:
-        """checkpoint writer 가 있으면 디스크 저장. 없으면 noop."""
+    def _save_checkpoint(self, state: SystemState, phase: str) -> SystemState:
+        """BudgetTracker 누적값을 state.budget 으로 sync 후 checkpoint 저장.
+
+        BudgetTracker (실시간 한도 검사용) 와 BudgetState (SystemState 의 영구 필드)
+        는 별도 객체 — sync 안 하면 cost / inspect 명령이 항상 0 보고.
+        """
+        synced = state.model_copy(
+            update={
+                "budget": state.budget.model_copy(
+                    update={
+                        "usd_used": self.budget.usd_used,
+                        "tokens_used": self.budget.tokens_used,
+                    }
+                )
+            }
+        )
         if self.checkpoint is not None:
-            self.checkpoint.save(state, phase)
+            self.checkpoint.save(synced, phase)
+        return synced
 
     async def _run_planning(self, state: SystemState) -> SystemState:
         """Phase 1: 3-round Planner.
@@ -563,14 +579,38 @@ class Orchestrator:
                     "config.generated_app.port_range 변경",
                 )
 
-        # 2) launch: cwd 를 workspace 로 주입 (LLM 은 run_id 를 모르므로 직접 작성 불가).
-        #    + acquired port 를 port_hint + PORT env 로 박아 ProcessManager / 산출 앱 공유.
+        # 2) launch: cwd / command / env 를 환경 독립적으로 주입.
+        #    - cwd: workspace dir (LLM 은 run_id 를 모르므로 직접 작성 불가)
+        #    - command[0] "python"/"python3" → sys.executable (code2e venv 의 인터프리터).
+        #      호스트 PATH 의 python 이 어떤 인터프리터일지 결정적이지 않으므로 명시적으로 박음.
+        #      산출 앱 의 런타임 deps (fastapi / uvicorn 등) 는 demo extra 로 venv 에 동봉.
+        #    - env: host VIRTUAL_ENV / PYTHONHOME / PYTHONPATH 누출 차단.
+        #      ProcessManager 가 {**os.environ, **spec.env} 로 merge 하므로 빈 문자열로 덮어쓰기.
+        #      PYTHONPATH 는 code2e 의 src 가 박혀 있어 산출 앱에 누출되면 import 충돌 가능.
+        #    - PORT: 할당된 포트를 env 로 전달 (planner 프롬프트가 이걸 읽도록 안내).
         workspace_dir = (self.workspace_root or Path(".")) / state.run_id
         workspace_dir.mkdir(parents=True, exist_ok=True)
-        spec_overrides: dict[str, object] = {"cwd": str(workspace_dir)}
+
+        command = list(spec.command)
+        if command and command[0] in ("python", "python3"):
+            command[0] = sys.executable
+
+        launch_env: dict[str, str] = {
+            **spec.env,
+            "VIRTUAL_ENV": "",
+            "PYTHONHOME": "",
+            "PYTHONPATH": "",
+        }
+        if port is not None:
+            launch_env["PORT"] = str(port)
+
+        spec_overrides: dict[str, object] = {
+            "cwd": str(workspace_dir),
+            "command": command,
+            "env": launch_env,
+        }
         if port is not None:
             spec_overrides["port_hint"] = port
-            spec_overrides["env"] = {**spec.env, "PORT": str(port)}
         spec_with_overrides = spec.model_copy(update=spec_overrides)
         info = await self.process_manager.launch(spec_with_overrides)
 

@@ -176,9 +176,10 @@ async def test_gateway_uses_cassette_hit_and_skips_provider(tmp_path: Path) -> N
     result = await gw2.call(**_DEFAULT_KW)  # type: ignore[arg-type]
     assert result.value == 1  # type: ignore[attr-defined]
     assert len(p2.calls) == 0  # provider 미호출
-    # cassette hit 일 때도 budget 누적은 cassette entry 의 cost 를 더하지 않는다 (이미 기록된 비용).
-    # 현재 구현: hit 시 budget.add 호출 안 함 → 검증.
-    assert b2.usd_used == 0.0
+    # cassette hit 시에도 budget 에 누적 — "이 run 이 LLM 에 부담시킨 가치" 추적.
+    # 실제 청구는 0 이지만 cost / inspect 명령이 의미 있는 metric 을 보이려면 필요.
+    assert b2.usd_used > 0.0
+    assert b2.tokens_used > 0
 
 
 @pytest.mark.asyncio

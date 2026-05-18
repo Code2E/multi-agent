@@ -270,6 +270,9 @@ class LlmGateway:
                 tokens_in: int = entry.tokens_in
                 tokens_out: int = entry.tokens_out
                 cost_usd: float = entry.cost_usd
+                # cassette hit 도 누적: "이 run 이 LLM 에 부담시킨 가치" 추적.
+                # 실제 청구는 0 이지만 metric / inspect / cost 명령 의미를 유지하기 위함.
+                self.budget.add(tokens_in, tokens_out, cost_usd)
             else:
                 if self.cassette.mode == "replay":
                     raise CassetteMissError(f"replay miss: agent={agent_name} key={key[:8]}")
