@@ -52,7 +52,7 @@ await expect(page.locator(".todo")).to_have_count(1)
 case 갯수 가이드:
 
 - unit 당 평균 1-3 case. 너무 적으면 acceptance_criteria 누락.
-- **전체 cases 합계는 20개 이하**. 단일 호출의 출력 한도(4096 토큰) 안에 모든
+- **전체 cases 합계는 20개 이하**. 단일 호출의 max_tokens 출력 한도 안에 모든
   cases 가 들어가야 하며, 초과 시 JSON 이 잘려 validation 실패합니다.
 - units 가 많아 20개로 cover 가 어려우면, 각 unit 의 가장 핵심
   acceptance_criteria 1개씩만 case 로 만드세요 (우선순위 기반 압축).

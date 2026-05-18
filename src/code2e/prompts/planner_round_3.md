@@ -50,7 +50,7 @@ output_schema: PlannerLlmOutput
    - `estimated_complexity`: "low" / "med" / "high".
 
    **상한 8개 근거**: Phase 2 의 Build 는 unit 당 최대 5 iter × (Executor + Advisor)
-   호출. Testgen 은 모든 units 을 한 응답에 담는 단일 호출 (4096 토큰 출력 한도).
+   호출. Testgen 은 모든 units 을 한 응답에 담는 단일 호출 (max_tokens 한도).
    units 가 많을수록 비용·시간 폭증 + testgen 응답 잘림 위험. 8 개를 넘는 작업이면
    하위 컴포넌트로 나눠 별도 task 로 실행하는 것을 권장.
 
