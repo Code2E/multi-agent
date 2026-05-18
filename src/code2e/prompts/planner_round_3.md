@@ -41,13 +41,18 @@ output_schema: PlannerLlmOutput
      `["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]` (셸 치환).
    - 각 unit 의 acceptance_criteria 에 "PORT 환경변수로 포트를 받는다" 같은 기준을 포함하세요.
 
-2. `units` (array, **반드시 1개 이상**):
+2. `units` (array, **반드시 1개 이상, 최대 8개**):
    - `id`: "U-001" / "U-002" 형식 (3자리 zero-padded, 1부터).
    - `title`: 한 줄 요약 (50자 이내).
    - `description`: 무엇을 만들 것인지 (1-3문장).
    - `acceptance_criteria`: 검증 가능한 기준 1개 이상. 블랙박스 테스트로 표현 가능해야 함.
    - `dependencies`: 다른 unit.id 의 배열 (선행 조건). 없으면 []. **순환 / 자기 참조 / 미존재 id 참조 금지**.
    - `estimated_complexity`: "low" / "med" / "high".
+
+   **상한 8개 근거**: Phase 2 의 Build 는 unit 당 최대 5 iter × (Executor + Advisor)
+   호출. Testgen 은 모든 units 을 한 응답에 담는 단일 호출 (4096 토큰 출력 한도).
+   units 가 많을수록 비용·시간 폭증 + testgen 응답 잘림 위험. 8 개를 넘는 작업이면
+   하위 컴포넌트로 나눠 별도 task 로 실행하는 것을 권장.
 
 DAG 규칙: dependencies 의 모든 id 는 같은 plan 의 다른 unit.id 여야 하고, 의존 그래프에 순환이 없어야 합니다.
 

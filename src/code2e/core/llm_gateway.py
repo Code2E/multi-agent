@@ -193,14 +193,17 @@ class AnthropicProvider:
         usage = getattr(resp, "usage", None)
         tokens_in = getattr(usage, "input_tokens", 0) if usage else 0
         tokens_out = getattr(usage, "output_tokens", 0) if usage else 0
+        stop_reason = getattr(resp, "stop_reason", None)
 
         return {
             "text": text,
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
+            "stop_reason": stop_reason,
             "raw": {
                 "model": getattr(resp, "model", model),
                 "id": getattr(resp, "id", ""),
+                "stop_reason": stop_reason,
             },
         }
 
@@ -295,6 +298,17 @@ class LlmGateway:
                 tokens_in = raw_in if isinstance(raw_in, int) else 0
                 tokens_out = raw_out if isinstance(raw_out, int) else 0
                 cost_usd = self.provider.estimate_cost(tokens_in, tokens_out, model)
+                # max_tokens 도달 감지: 출력이 한도에 막혀 JSON 이 잘렸을 가능성 ↑.
+                # 다음 단계 (parse + validate) 가 실패할 확률이 높으니 사용자에게 미리 알림.
+                if resp.get("stop_reason") == "max_tokens":
+                    logger.warning(
+                        "max_tokens reached (agent=%s, prompt_key=%s, tokens_out=%d) — "
+                        "응답이 잘렸을 수 있습니다. units / cases 수를 줄이거나 "
+                        "max_tokens 한도를 높이세요.",
+                        agent_name,
+                        prompt_key,
+                        tokens_out,
+                    )
 
                 # 4) cassette record (mode=record/auto).
                 if self.cassette.mode in {"record", "auto"}:
