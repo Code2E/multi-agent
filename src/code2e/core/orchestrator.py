@@ -33,7 +33,7 @@ from pydantic import ValidationError
 
 from code2e.core.budget import BudgetExceededError, BudgetTracker
 from code2e.core.checkpoint import CheckpointWriter
-from code2e.core.llm_gateway import LlmGateway, RepairExhaustedError
+from code2e.core.llm_gateway import LlmGateway, LlmPermanentError, RepairExhaustedError
 from code2e.core.port_allocator import PortAllocator, PortUnavailableError
 from code2e.core.process_manager import ProcessManager
 from code2e.core.schemas import (
@@ -239,6 +239,15 @@ class Orchestrator:
                     "Phase 1",
                     f"round {round_no} 진행 중 취소됨",
                     "code2e run --resume <run_id> 로 재개",
+                )
+            except LlmPermanentError as e:
+                # 4xx auth / 모델 미존재 등. RepairExhaustedError 는 위에서 이미 처리됨.
+                return self._aborted(
+                    new_state,
+                    "INTERNAL_ERROR",
+                    "Phase 1",
+                    f"round {round_no} LLM provider 영구 실패: {e}",
+                    "ANTHROPIC_API_KEY 유효성 + 모델 이름 확인",
                 )
 
             plans.append(plan)
@@ -648,7 +657,20 @@ class Orchestrator:
         # 2) launch: cwd / command / env 를 환경 독립적으로 주입. _build_launch_spec
         #    헬퍼 (Phase 3 restart 도 동일 override 필요 — 안 그러면 PORT env 누락).
         spec_with_overrides = self._build_launch_spec(spec, state.run_id, port)
-        info = await self.process_manager.launch(spec_with_overrides)
+        try:
+            info = await self.process_manager.launch(spec_with_overrides)
+        except OSError as e:
+            # command not found / permission denied / exec format error 등.
+            # 획득한 port 가 leak 되지 않도록 명시적 release.
+            if port is not None:
+                await self.port_allocator.release(port)
+            return self._aborted(
+                state,
+                "INTERNAL_ERROR",
+                "Phase L",
+                f"산출물 subprocess 시작 실패: {e}",
+                f"launch_spec.command 확인: {list(spec_with_overrides.command)}",
+            )
 
         # 3) health check (startup_timeout_s 동안 polling).
         ok = await self.process_manager.health_check(
@@ -705,10 +727,17 @@ class Orchestrator:
                 if state.plan.launch_spec is not None
                 else 5
             )
-            await self.process_manager.teardown(info, grace_s=grace_s)
+            # docstring 명시: teardown 자체 실패해도 phase 결과 보존. 예외 삼킴.
+            try:
+                await self.process_manager.teardown(info, grace_s=grace_s)
+            except OSError as e:
+                self.logger.warning("teardown 실패 (무시): %s", e)
 
         if self.port_allocator is not None and info.port is not None:
-            await self.port_allocator.release(info.port)
+            try:
+                await self.port_allocator.release(info.port)
+            except Exception as e:  # noqa: BLE001
+                self.logger.warning("port release 실패 (무시): %s", e)
 
         return state
 
@@ -782,7 +811,20 @@ class Orchestrator:
         launch_info = state.launch
         suite = state.test.suite
 
-        await self.evaluator_testrun.runner.setup(workspace.root)
+        # runner.setup 은 Playwright browser launch 등 외부 자원 잡음. 실패 시
+        # 명확한 abort 메시지 + doctor 가이드 — 그냥 propagate 하면 사용자가 stack
+        # trace 만 받음.
+        try:
+            await self.evaluator_testrun.runner.setup(workspace.root)
+        except Exception as e:  # noqa: BLE001
+            return self._aborted(
+                state,
+                "INTERNAL_ERROR",
+                "Phase 3",
+                f"test runner setup 실패: {e}",
+                "code2e doctor 로 playwright 설치 확인 (playwright install chromium)",
+            )
+
         try:
             for iteration in range(PHASE3_MAX_ITERATIONS):
                 ctx = self._build_ctx(state.run_id, attempt=iteration, phase="p3")
