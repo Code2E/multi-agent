@@ -619,6 +619,7 @@ class Orchestrator:
             info, spec.health_check, timeout_s=spec.startup_timeout_s
         )
         if not ok:
+            log_tail = _tail_log(info.log_path, n=15)
             await self.process_manager.teardown(info, grace_s=spec.teardown_grace_s)
             if port is not None:
                 await self.port_allocator.release(port)
@@ -626,20 +627,25 @@ class Orchestrator:
                 state,
                 "LAUNCH_TIMEOUT",
                 "Phase L",
-                f"산출물이 {spec.startup_timeout_s}s 안에 health check 통과 못함",
-                f"tail {info.log_path}",
+                f"산출물이 {spec.startup_timeout_s}s 안에 health check 통과 못함 "
+                f"(expected port={port}).\n"
+                f"--- last {log_tail.count(chr(10))} log lines ---\n{log_tail}",
+                f"앱이 PORT env({port}) 와 다른 포트에서 listen 중이거나 health "
+                f"endpoint 응답 불가. 전체 로그: tail {info.log_path}",
             )
 
         # 4) health 직후 사망 검사 (race condition: TCP listening 후 즉시 crash).
         if not await self.process_manager.is_alive(info):
+            log_tail = _tail_log(info.log_path, n=15)
             if port is not None:
                 await self.port_allocator.release(port)
             return self._aborted(
                 state,
                 "APP_CRASHED",
                 "Phase L",
-                "health check 직후 산출물 비정상 종료",
-                f"tail {info.log_path}",
+                f"health check 직후 산출물 비정상 종료.\n"
+                f"--- last {log_tail.count(chr(10))} log lines ---\n{log_tail}",
+                f"전체 로그: tail {info.log_path}",
             )
 
         # 5) healthy_at 업데이트.
@@ -906,6 +912,23 @@ def _extract_frontmatter(text: str) -> str | None:
     """문서 처음의 YAML frontmatter 본문 (`---` 사이) 반환. 없으면 None."""
     m = _FRONTMATTER_RE.match(text)
     return m.group(1) if m else None
+
+
+def _tail_log(log_path: str, n: int = 15) -> str:
+    """app-logs 파일 마지막 N 줄을 안전하게 읽어 반환. 파일이 없거나 읽기 실패 시 안내 문자열.
+
+    Phase L abort 시 진단 자동화용. uvicorn 의 "Running on http://..." / Python
+    traceback / "Address already in use" 같은 결정적 단서가 마지막 영역에 모이는
+    경향이라 tail 만으로도 80% 케이스 진단 가능.
+    """
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except (OSError, FileNotFoundError):
+        return "(log unavailable)"
+    if not lines:
+        return "(log empty)"
+    return "".join(lines[-n:]).rstrip()
 
 
 def _parse_yaml_dict(yaml_text: str) -> dict[str, object] | None:
