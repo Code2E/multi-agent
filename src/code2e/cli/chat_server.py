@@ -1,11 +1,13 @@
-"""Code2E Chat — 로컬 웹 인터페이스 (v0).
+"""Code2E Chat — 로컬 웹 인터페이스 (v1).
 
-FastAPI + Server-Sent Events 로 단일 run 진행을 실시간 push.
+FastAPI + Server-Sent Events 로 멀티 run 세션을 실시간 push.
 
 DECISION:
-- v0 는 단일 run per session. follow-up 은 v1.
-- chat 모드는 Teardown 을 skip 해 산출 앱이 세션 동안 살아있음 → iframe preview.
-- SSE 단방향 (WebSocket 보다 단순). 클라이언트는 EventSource API.
+- v1: follow-up task 가능. 한 세션에서 여러 run 누적. run history sidebar.
+- 각 run 마다 별도 EventEmitter — SSE 는 활성 run 의 emitter 를 자동 follow.
+- 새 run 시작 시 이전 run 의 산출 앱 process 자동 teardown (port 재사용).
+- chat 모드는 Teardown 을 skip 해 산출 앱이 다음 run 시작 전까지 살아있음 → iframe preview.
+- SSE 단방향. 클라이언트는 EventSource API + 새 run 시 재연결.
 - v4 ADR-040/041/036 와 충돌 없음 — UI wrapper, agent 추가 없음, localhost.
 """
 
@@ -45,11 +47,13 @@ def build_chat_app(
     """
     from code2e.cli.commands.run import _build_orchestrator  # noqa: PLC0415
 
+    # v1: 세션 = 여러 run 누적. state 가 history 와 활성 run 모두 추적.
     state: dict[str, Any] = {
-        "emitter": None,
-        "task": None,
-        "run_id": None,
-        "active_process": None,  # (pm, launch_info, port_allocator) — shutdown 시 cleanup
+        "emitter": None,         # 활성 emitter (현재 진행 중 run)
+        "task": None,            # 활성 asyncio.Task
+        "active_run_id": None,
+        "active_process": None,  # (pm, launch_info, alloc) — 다음 run 시작 / shutdown 시 cleanup
+        "history": [],           # [{run_id, task, status, usd, tokens, base_url, ts}]
     }
 
     @asynccontextmanager
@@ -78,9 +82,9 @@ def build_chat_app(
 
     @app.post("/chat")
     async def chat(payload: dict[str, Any]) -> JSONResponse:
-        """task 입력 → background 에서 Orchestrator.start 실행.
+        """task 입력 → background 에서 Orchestrator.start 실행. v1: follow-up 지원.
 
-        반환: {run_id, status: 'started'}. 진행 상황은 /events 로.
+        새 task 시작 시 이전 run 의 산출 process 를 teardown (port 재사용 + 메모리 정리).
         """
         task = (payload.get("task") or "").strip()
         if not task:
@@ -91,7 +95,21 @@ def build_chat_app(
                 {"error": "another run in progress"}, status_code=409
             )
 
-        # 새 emitter + orchestrator. 기존 SSE 구독자는 새 emitter 로 재구독해야 함 (v1 에서 개선).
+        # 이전 run 의 산출 process teardown — 같은 port 재사용 가능.
+        prev = state.get("active_process")
+        if prev is not None:
+            pm, info, alloc = prev
+            try:
+                await pm.teardown(info, grace_s=3)
+            except Exception:  # noqa: BLE001
+                pass
+            if alloc is not None and info.port is not None:
+                try:
+                    await alloc.release(info.port)
+                except Exception:  # noqa: BLE001
+                    pass
+            state["active_process"] = None
+
         emitter = EventEmitter()
         budget_usd = float(payload.get("budget_usd") or 5.0)
         orch = _build_orchestrator(
@@ -106,20 +124,52 @@ def build_chat_app(
 
         async def _run() -> None:
             try:
-                # chat 모드: Teardown skip → 산출 앱 iframe 살아있음.
                 result = await orch.start(task, run_id=None, skip_teardown=True)
-                state["run_id"] = result.run_id
-                # 다음 task 가 새 process 띄울 수 있도록 active process 추적.
+                state["active_run_id"] = result.run_id
                 if result.launch is not None and orch.process_manager is not None:
-                    state["active_process"] = (orch.process_manager, result.launch, orch.port_allocator)
+                    state["active_process"] = (
+                        orch.process_manager,
+                        result.launch,
+                        orch.port_allocator,
+                    )
+                # history 누적.
+                state["history"].append(
+                    {
+                        "run_id": result.run_id,
+                        "task": task,
+                        "status": result.status,
+                        "usd_used": orch.budget.usd_used,
+                        "tokens_used": orch.budget.tokens_used,
+                        "base_url": result.launch.base_url if result.launch else None,
+                        "termination_reason": (
+                            result.termination.reason if result.termination else None
+                        ),
+                    }
+                )
             except Exception as e:  # noqa: BLE001
                 emitter.emit("run.exception", {"error": str(e), "type": type(e).__name__})
+                state["history"].append(
+                    {
+                        "run_id": "(error)",
+                        "task": task,
+                        "status": "exception",
+                        "usd_used": orch.budget.usd_used,
+                        "tokens_used": orch.budget.tokens_used,
+                        "base_url": None,
+                        "termination_reason": type(e).__name__,
+                    }
+                )
             finally:
                 emitter.close()
 
         state["emitter"] = emitter
         state["task"] = asyncio.create_task(_run())
         return JSONResponse({"status": "started"})
+
+    @app.get("/api/history")
+    async def get_history() -> JSONResponse:
+        """세션의 모든 run 메타 반환. 새로고침 후 sidebar 복원용."""
+        return JSONResponse({"history": state["history"]})
 
     @app.get("/events")
     async def events() -> StreamingResponse:
