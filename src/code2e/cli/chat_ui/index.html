@@ -141,6 +141,71 @@
   #send-btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(139,92,246,0.3); }
   #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+  #cancel-btn {
+    background: var(--bg-1);
+    color: var(--bad);
+    border: 1px solid var(--bad);
+    border-radius: 8px; padding: 8px 14px;
+    cursor: pointer; font-size: 13px; font-weight: 600;
+    display: none;
+  }
+  #cancel-btn:hover { background: rgba(239, 68, 68, 0.1); }
+  #cancel-btn.visible { display: block; }
+
+  /* === Preview tabs (v2) === */
+  .preview-tabs { display: flex; gap: 4px; padding: 0 12px; padding-top: 8px; }
+  .preview-tab {
+    padding: 6px 14px; font-size: 12px; cursor: pointer;
+    background: var(--bg-2); border: 1px solid var(--border);
+    border-bottom: none; border-radius: 8px 8px 0 0;
+    color: var(--fg-2); font-weight: 500;
+  }
+  .preview-tab.active { background: var(--bg-1); color: var(--fg-0); border-color: var(--accent); }
+  .preview-content { display: none; }
+  .preview-content.active { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 10px; }
+  #source-tabs { display: flex; gap: 4px; padding: 4px 0; flex-wrap: wrap; }
+  .source-file-tab {
+    padding: 4px 10px; font-size: 11px;
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: 6px;
+    cursor: pointer; color: var(--fg-1);
+  }
+  .source-file-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #source-code {
+    flex: 1; min-height: 0;
+    background: var(--bg-0); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px;
+    font-family: "SF Mono", "Monaco", "Consolas", monospace;
+    font-size: 12px; line-height: 1.55;
+    color: var(--fg-0);
+    overflow: auto;
+    white-space: pre;
+  }
+
+  /* === Toast === */
+  #toast-container {
+    position: fixed; top: 70px; right: 20px;
+    display: flex; flex-direction: column; gap: 8px;
+    z-index: 1000; pointer-events: none;
+  }
+  .toast {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: var(--fg-0);
+    font-size: 13px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+    min-width: 260px;
+    animation: slideIn 0.25s ease-out, fadeOut 0.4s ease-in 4s forwards;
+    pointer-events: auto;
+  }
+  .toast.success { border-color: var(--good); }
+  .toast.error { border-color: var(--bad); }
+  .toast .t-title { font-weight: 600; }
+  .toast .t-body { color: var(--fg-2); font-size: 12px; margin-top: 4px; }
+  @keyframes slideIn { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+  @keyframes fadeOut { to { opacity: 0; transform: translateX(120%); } }
+
   /* === Pipeline Monitor === */
   #pipe-body { flex: 1; overflow-y: auto; padding: 16px; }
   .phase-card {
@@ -246,6 +311,7 @@
       <div class="input-row">
         <input type="number" id="budget-input" value="5" min="0.1" step="0.5" title="budget (USD)" />
         <button id="send-btn">실행</button>
+        <button id="cancel-btn">취소</button>
       </div>
     </div>
   </section>
@@ -290,18 +356,31 @@
   <!-- Preview -->
   <section class="panel">
     <div class="panel-title">Result Preview</div>
+    <div class="preview-tabs">
+      <div class="preview-tab active" data-tab="live">Live</div>
+      <div class="preview-tab" data-tab="source">Source</div>
+    </div>
     <div id="preview-body">
-      <div id="preview-empty">
-        Phase L 통과 후 산출 앱이 여기 표시됩니다.
+      <div class="preview-content active" data-tab-content="live" style="flex:1; display:flex; flex-direction:column; gap:10px; padding:12px; min-height:0;">
+        <div id="preview-empty">
+          Phase L 통과 후 산출 앱이 여기 표시됩니다.
+        </div>
+        <div class="preview-info" id="preview-info" style="display:none;">
+          <span class="pill">LIVE</span>
+          <span id="preview-url"></span>
+          <a href="#" target="_blank" id="preview-open">새 탭으로 열기 ↗</a>
+        </div>
       </div>
-      <div class="preview-info" id="preview-info" style="display:none;">
-        <span class="pill">LIVE</span>
-        <span id="preview-url"></span>
-        <a href="#" target="_blank" id="preview-open">새 탭으로 열기 ↗</a>
+      <div class="preview-content" data-tab-content="source" style="padding:12px;">
+        <div id="source-tabs"></div>
+        <pre id="source-code">// run 완료 후 source code 가 여기 표시됩니다.</pre>
       </div>
     </div>
   </section>
 </main>
+
+<!-- Toast container (v2) -->
+<div id="toast-container"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -394,8 +473,10 @@ function connectSSE() {
       addMessage("system",
         `<strong>✓ 완료</strong><br>run id: <code>${d.run_id}</code><br>cost: $${Number(d.usd_used).toFixed(4)} / tokens: ${Number(d.tokens_used).toLocaleString()}`,
         "completed");
-      $("send-btn").disabled = false;
+      setRunning(false);
       refreshHistory();
+      loadSource(d.run_id);
+      showToast("✓ Run 완료", `${d.run_id} · $${Number(d.usd_used).toFixed(4)}`, "success");
     },
     "run.aborted": (d) => {
       const t = d.termination || {};
@@ -404,15 +485,17 @@ function connectSSE() {
       addMessage("system",
         `<strong>✗ 중단</strong> (${d.phase})<br>reason: <code>${t.reason || "?"}</code><br><div class="meta">${(t.details || "").replace(/\n/g,"<br>")}</div>`,
         "aborted");
-      $("send-btn").disabled = false;
+      setRunning(false);
       refreshHistory();
+      showToast("✗ 중단", `${d.phase} · ${t.reason || "?"}`, "error");
     },
     "run.exception": (d) => {
       addMessage("system",
         `<strong>✗ 예외</strong><br><code>${d.type}: ${d.error}</code>`,
         "aborted");
-      $("send-btn").disabled = false;
+      setRunning(false);
       refreshHistory();
+      showToast("✗ 예외", `${d.type}: ${d.error}`, "error");
     },
   };
 
@@ -446,7 +529,7 @@ async function sendTask() {
   resetPipeline();
   addMessage("user", task.replace(/\n/g,"<br>"));
   $("task-input").value = "";
-  $("send-btn").disabled = true;
+  setRunning(true);
 
   // SSE 먼저 (재)연결.
   connectSSE();
@@ -513,6 +596,7 @@ function selectHistory(idx, item) {
   document.querySelectorAll(".history-item")[document.querySelectorAll(".history-item").length - 1 - idx]?.classList.add("active");
   if (item.base_url) showPreview(item.base_url);
   setStats(item.usd_used, item.tokens_used, item.run_id, item.status);
+  loadSource(item.run_id);
   addMessage("system",
     `<strong>History</strong>: ${escapeHtml(item.task).slice(0,80)}...<br>
     <div class="meta">run_id: <code>${item.run_id}</code> · status: ${item.status} · cost: $${Number(item.usd_used || 0).toFixed(4)}</div>`);
@@ -522,12 +606,75 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
+// === v2: Cancel ===
+$("cancel-btn").addEventListener("click", async () => {
+  $("cancel-btn").disabled = true;
+  $("cancel-btn").textContent = "취소 중...";
+  try { await fetch("/api/cancel", { method: "POST" }); } catch (e) {}
+});
+
+function setRunning(running) {
+  $("send-btn").disabled = running;
+  $("cancel-btn").classList.toggle("visible", running);
+  $("cancel-btn").disabled = false;
+  $("cancel-btn").textContent = "취소";
+}
+
+// === v2: Source preview tab ===
+document.querySelectorAll(".preview-tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".preview-tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".preview-content").forEach(c => c.classList.remove("active"));
+    tab.classList.add("active");
+    document.querySelector(`[data-tab-content="${tab.dataset.tab}"]`).classList.add("active");
+  });
+});
+
+let currentSourceFiles = {};
+async function loadSource(runId) {
+  try {
+    const resp = await fetch(`/api/runs/${runId}/source`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    currentSourceFiles = data.files || {};
+    renderSourceTabs();
+  } catch (e) { /* ignore */ }
+}
+
+function renderSourceTabs() {
+  const tabs = $("source-tabs");
+  tabs.innerHTML = "";
+  const names = Object.keys(currentSourceFiles);
+  if (!names.length) {
+    $("source-code").textContent = "// source 파일이 없습니다.";
+    return;
+  }
+  names.forEach((name, i) => {
+    const tab = document.createElement("div");
+    tab.className = "source-file-tab" + (i === 0 ? " active" : "");
+    tab.textContent = name;
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".source-file-tab").forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      $("source-code").textContent = currentSourceFiles[name];
+    });
+    tabs.appendChild(tab);
+  });
+  $("source-code").textContent = currentSourceFiles[names[0]];
+}
+
+// === v2: Toast ===
+function showToast(title, body, type) {
+  const el = document.createElement("div");
+  el.className = "toast " + (type || "");
+  el.innerHTML = `<div class="t-title">${escapeHtml(title)}</div>${body ? `<div class="t-body">${escapeHtml(body)}</div>` : ""}`;
+  $("toast-container").appendChild(el);
+  setTimeout(() => el.remove(), 5000);
+}
+
 // 초기 SSE 연결 (idle) + history 로드.
 connectSSE();
 refreshHistory();
-
-// run 끝나면 history 자동 update.
-const origCompleted = null;  // dummy
 </script>
 </body>
 </html>

@@ -48,9 +48,11 @@ def build_chat_app(
     from code2e.cli.commands.run import _build_orchestrator  # noqa: PLC0415
 
     # v1: 세션 = 여러 run 누적. state 가 history 와 활성 run 모두 추적.
+    # v2: cancel_token 추가 (활성 run 중단용).
     state: dict[str, Any] = {
         "emitter": None,         # 활성 emitter (현재 진행 중 run)
         "task": None,            # 활성 asyncio.Task
+        "cancel_token": None,    # 활성 asyncio.Event (set 시 orchestrator 가 abort)
         "active_run_id": None,
         "active_process": None,  # (pm, launch_info, alloc) — 다음 run 시작 / shutdown 시 cleanup
         "history": [],           # [{run_id, task, status, usd, tokens, base_url, ts}]
@@ -121,6 +123,8 @@ def build_chat_app(
             budget_usd_override=budget_usd,
         )
         orch.emitter = emitter
+        # v2 cancel: orchestrator 의 cancel_token 을 state 에 노출 → /cancel 엔드포인트가 set.
+        state["cancel_token"] = orch.cancel_token
 
         async def _run() -> None:
             try:
@@ -170,6 +174,17 @@ def build_chat_app(
     async def get_history() -> JSONResponse:
         """세션의 모든 run 메타 반환. 새로고침 후 sidebar 복원용."""
         return JSONResponse({"history": state["history"]})
+
+    @app.post("/api/cancel")
+    async def cancel() -> JSONResponse:
+        """진행 중 run 의 cancel_token 을 set. orchestrator 가 다음 LLM 호출 직전
+        또는 await 지점에서 asyncio.CancelledError raise → _aborted(CANCELLED).
+        """
+        tok = state.get("cancel_token")
+        if tok is None:
+            return JSONResponse({"error": "no active run"}, status_code=409)
+        tok.set()
+        return JSONResponse({"status": "cancel requested"})
 
     @app.get("/events")
     async def events() -> StreamingResponse:
