@@ -55,7 +55,7 @@ from code2e.core.schemas import (
     TestRun,
     UnitState,
 )
-from code2e.core.state import new_run_id
+from code2e.core.state import new_run_id, slugify_task
 from code2e.core.termination import (
     decide_force_stop_on_empty_revise,
     is_stagnant,
@@ -112,7 +112,7 @@ class Orchestrator:
         - 현재 Phase L / 3 / Teardown 은 stub (NotImplementedError) — 진입 시
           INTERNAL_ERROR 로 우아하게 abort. 별도 commit 으로 구현 예정.
         """
-        rid = run_id or new_run_id()
+        rid = run_id or new_run_id(slugify_task(user_input))
         state = SystemState(
             run_id=rid,
             status="planning",

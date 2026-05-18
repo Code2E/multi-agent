@@ -68,7 +68,13 @@ def run(
         DEFAULT_CASSETTES_DIR, "--cassettes-dir", help="Cassettes root directory."
     ),
     run_id: str | None = typer.Option(
-        None, "--run-id", help="Explicit run id (default: auto r_<unix>_<rand>)."
+        None, "--run-id", help="Explicit run id (overrides --name and auto slug)."
+    ),
+    name: str | None = typer.Option(
+        None,
+        "--name",
+        help="Run label for human-readable run dir (e.g., 'calculator'). "
+        "Becomes 'r_<name>_<unix>'. Ignored if --run-id given.",
     ),
 ) -> None:
     """Run the multi-agent pipeline end-to-end."""
@@ -103,6 +109,12 @@ def run(
         runs_dir=runs_dir,
         budget_usd_override=budget_usd,
     )
+
+    # run_id 우선순위: --run-id (완전 명시) > --name (slug) > task 기반 자동.
+    if run_id is None and name is not None:
+        from code2e.core.state import new_run_id  # noqa: PLC0415
+
+        run_id = new_run_id(slug=name)
 
     state = asyncio.run(orch.start(user_input, run_id=run_id))
     _render_result(state)
