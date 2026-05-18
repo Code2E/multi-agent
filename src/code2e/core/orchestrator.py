@@ -742,13 +742,12 @@ class Orchestrator:
         workspace = Workspace(root=self.workspace_root / state.run_id)
         runs: list[TestRun] = []
         previously_passed: set[str] = set()
-        # 첫 unit 만 단순화 (v1.1 에서 case → unit 매핑 정교화).
-        target_unit = (
-            state.plan.final.units[0]
+        all_units = (
+            list(state.plan.final.units)
             if state.plan.final is not None and state.plan.final.units
-            else None
+            else []
         )
-        if target_unit is None:
+        if not all_units:
             return self._aborted(
                 state,
                 "INTERNAL_ERROR",
@@ -756,6 +755,9 @@ class Orchestrator:
                 "target unit 없음",
                 "Plan units 확인",
             )
+        # 매 iter 마다 실패한 case 의 plan_unit_refs 로 target 동적 결정 (아래 loop).
+        # fallback (refs 매핑 실패 시) 은 topological 첫 unit.
+        fallback_unit = all_units[0]
 
         # launch_info / suite 변수로 narrow 유지 — loop 안 state.model_copy 후에도 타입 추론 안전.
         launch_info = state.launch
@@ -813,7 +815,10 @@ class Orchestrator:
                     else None
                 )
 
-                # 5) Executor revise.
+                # 5) target unit 결정 + Executor revise.
+                #    실패 case 의 plan_unit_refs 에서 가장 자주 등장한 unit 선택.
+                #    매핑 실패 시 fallback (topological 첫 unit). v1 first-only 한계 해소.
+                target_unit = _pick_target_unit(run, suite, all_units, fallback_unit)
                 files = workspace.snapshot()
                 try:
                     change = await self.executor.invoke(
@@ -929,6 +934,46 @@ def _extract_frontmatter(text: str) -> str | None:
     """문서 처음의 YAML frontmatter 본문 (`---` 사이) 반환. 없으면 None."""
     m = _FRONTMATTER_RE.match(text)
     return m.group(1) if m else None
+
+
+def _pick_target_unit(
+    run: TestRun,
+    suite: list[TestCase],
+    all_units: list[PlanUnit],
+    fallback: PlanUnit,
+) -> PlanUnit:
+    """실패한 case 들의 plan_unit_refs 에서 가장 자주 등장하는 unit 선택.
+
+    Phase 3 revise loop 에서 호출. 종전엔 항상 units[0] 만 fix 시도해
+    다른 unit 관련 test 실패는 영영 못 고치는 v1 simplification 이 있었음 — 이 함수가
+    test failure → unit 매핑을 통해 매 iter 적절한 target 선택.
+
+    tie 해결: all_units (topological_sort 순서) 의 앞쪽 unit 우선. 매핑이 전부
+    실패하거나 plan_unit_refs 가 비어 있으면 fallback (= 첫 unit).
+    """
+    failed_case_ids = {r.case_id for r in run.results if r.status != "passed"}
+    if not failed_case_ids:
+        return fallback
+
+    suite_by_id = {c.id: c for c in suite}
+    unit_fail_count: dict[str, int] = {}
+    for fcid in failed_case_ids:
+        case = suite_by_id.get(fcid)
+        if case is None:
+            continue
+        for unit_id in case.plan_unit_refs:
+            unit_fail_count[unit_id] = unit_fail_count.get(unit_id, 0) + 1
+
+    if not unit_fail_count:
+        return fallback
+
+    max_count = max(unit_fail_count.values())
+    top_unit_ids = {uid for uid, c in unit_fail_count.items() if c == max_count}
+    # all_units 의 순서 (topological) 따라 첫 매칭 unit 반환.
+    for u in all_units:
+        if u.id in top_unit_ids:
+            return u
+    return fallback
 
 
 _HTTP_TASK_KEYWORDS = re.compile(
