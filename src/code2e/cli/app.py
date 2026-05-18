@@ -16,6 +16,7 @@ from code2e.cli.commands import (
     prompt,
     run,
     runs,
+    tui,
 )
 
 app = typer.Typer(
@@ -28,6 +29,7 @@ app.command("init")(init.init)
 app.command("doctor")(doctor.doctor)
 app.command("run")(run.run)
 app.command("chat")(chat.chat)
+app.command("tui")(tui.tui)
 app.command("inspect")(inspect.inspect)
 app.command("diff")(diff.diff)
 
