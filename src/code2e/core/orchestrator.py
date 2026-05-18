@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from code2e.agents.evaluator import EvaluatorTestgenAgent, EvaluatorTestrunAgent
     from code2e.agents.executor import ExecutorAgent
     from code2e.agents.planner import PlannerAgent
+    from code2e.core.event_emitter import EventEmitter
 
 FAILURE_REPORT_HEAD_BYTES = 5 * 1024  # Q39
 FAILURE_REPORT_TAIL_BYTES = 5 * 1024
@@ -104,14 +105,27 @@ class Orchestrator:
     logger: structlog.stdlib.BoundLogger = field(
         default_factory=lambda: structlog.get_logger("orchestrator")
     )
+    # `code2e chat` 같은 외부 관찰자 (SSE / WebSocket) 가 phase 진행을 stream
+    # 하기 위한 hook. None 이면 noop — 기존 batch 흐름 그대로.
+    emitter: "EventEmitter | None" = None
 
-    async def start(self, user_input: str, run_id: str | None = None) -> SystemState:
+    def _emit(self, event_type: str, data: dict[str, object] | None = None) -> None:
+        """emitter 가 주입돼 있으면 push. 안 돼 있으면 noop. 파이프라인은 절대 block 안 됨."""
+        if self.emitter is not None:
+            self.emitter.emit(event_type, data)
+
+    async def start(
+        self,
+        user_input: str,
+        run_id: str | None = None,
+        skip_teardown: bool = False,
+    ) -> SystemState:
         """파이프라인 entry point. Phase 1 → 2 → L → 3 → Teardown 순차 실행.
 
         - 매 phase 종료 후 checkpoint 저장 (있으면).
         - status='aborted' 면 즉시 return — 다음 phase 진입 안 함.
-        - 현재 Phase L / 3 / Teardown 은 stub (NotImplementedError) — 진입 시
-          INTERNAL_ERROR 로 우아하게 abort. 별도 commit 으로 구현 예정.
+        - `skip_teardown=True`: chat / preview 모드에서 산출 앱을 살려둠 (호출자가
+          별도로 teardown 책임). v4 ADR 외 운영 모드.
         """
         rid = run_id or new_run_id(slugify_task(user_input))
         state = SystemState(
@@ -123,39 +137,105 @@ class Orchestrator:
                 limit_tokens=self.budget.limit_tokens,
             ),
         )
+        self._emit("run.start", {"run_id": rid, "user_input": user_input})
+
+        def _phase_emit(name: str, suffix: str, extra: dict[str, object] | None = None) -> None:
+            payload: dict[str, object] = {
+                "phase": name,
+                "status": state.status,
+                "usd_used": self.budget.usd_used,
+                "tokens_used": self.budget.tokens_used,
+            }
+            if extra:
+                payload.update(extra)
+            self._emit(f"phase.{name}.{suffix}", payload)
 
         # Phase 1.
+        _phase_emit("planning", "start")
         state = await self._run_planning(state)
         state = self._save_checkpoint(state, "planning")
+        _phase_emit(
+            "planning",
+            "end",
+            {
+                "rounds": len(state.plan.iterations),
+                "units": len(state.plan.final.units) if state.plan.final else 0,
+            },
+        )
         if state.status == "aborted":
+            self._emit("run.aborted", {"phase": "planning", "termination": state.termination.model_dump(mode="json") if state.termination else None})
             return state
 
         # Phase 2.
+        _phase_emit("building", "start")
         state = await self._run_building_and_testgen(state)
         state = self._save_checkpoint(state, "building")
+        _phase_emit(
+            "building",
+            "end",
+            {
+                "units_approved": sum(1 for u in state.build.units if u.status == "approved"),
+                "units_total": len(state.build.units),
+                "test_cases": len(state.test.suite or []),
+            },
+        )
         if state.status == "aborted":
+            self._emit("run.aborted", {"phase": "building", "termination": state.termination.model_dump(mode="json") if state.termination else None})
             return state
 
-        # Phase L (stub — 별도 commit).
+        # Phase L.
+        _phase_emit("launching", "start")
         state = await self._safe_phase(state, self._run_launching, "Phase L")
         state = self._save_checkpoint(state, "launching")
+        _phase_emit(
+            "launching",
+            "end",
+            {"base_url": state.launch.base_url if state.launch else None},
+        )
         if state.status == "aborted":
+            self._emit("run.aborted", {"phase": "launching", "termination": state.termination.model_dump(mode="json") if state.termination else None})
             return state
 
-        # Phase 3 (stub).
+        # Phase 3.
+        _phase_emit("testing", "start")
         state = await self._safe_phase(state, self._run_testing, "Phase 3")
         state = self._save_checkpoint(state, "testing")
+        _phase_emit(
+            "testing",
+            "end",
+            {
+                "iterations": len(state.test.runs),
+                "passed": state.test.runs[-1].summary.passed if state.test.runs else 0,
+                "failed": state.test.runs[-1].summary.failed if state.test.runs else 0,
+            },
+        )
         if state.status == "aborted":
+            self._emit("run.aborted", {"phase": "testing", "termination": state.termination.model_dump(mode="json") if state.termination else None})
             return state
 
-        # Teardown (stub).
-        state = await self._safe_phase(state, self._teardown, "Teardown")
-        state = self._save_checkpoint(state, "teardown")
-        if state.status == "aborted":
-            return state
+        # Teardown — chat 모드에선 산출 앱을 살려둬 iframe preview 가능.
+        if skip_teardown:
+            _phase_emit("teardown", "start")
+            _phase_emit("teardown", "end", {"skipped": True})
+        else:
+            _phase_emit("teardown", "start")
+            state = await self._safe_phase(state, self._teardown, "Teardown")
+            state = self._save_checkpoint(state, "teardown")
+            _phase_emit("teardown", "end")
+            if state.status == "aborted":
+                self._emit("run.aborted", {"phase": "teardown", "termination": state.termination.model_dump(mode="json") if state.termination else None})
+                return state
 
         final_state = state.model_copy(update={"status": "completed"})
         final_state = self._save_checkpoint(final_state, "completed")
+        self._emit(
+            "run.completed",
+            {
+                "run_id": rid,
+                "usd_used": self.budget.usd_used,
+                "tokens_used": self.budget.tokens_used,
+            },
+        )
         return final_state
 
     async def _safe_phase(

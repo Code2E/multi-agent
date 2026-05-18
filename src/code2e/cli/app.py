@@ -6,6 +6,7 @@ import typer
 
 from code2e.cli.commands import (
     cassettes,
+    chat,
     cost,
     diff,
     doctor,
@@ -26,6 +27,7 @@ app = typer.Typer(
 app.command("init")(init.init)
 app.command("doctor")(doctor.doctor)
 app.command("run")(run.run)
+app.command("chat")(chat.chat)
 app.command("inspect")(inspect.inspect)
 app.command("diff")(diff.diff)
 
