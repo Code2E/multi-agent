@@ -40,13 +40,18 @@ def _sanitize_surrogates(text: str) -> str:
 
     1) `\\uD83C\\uDFF7` 같은 escape sequence → 실제 이모지 character.
     2) raw surrogate (UTF-16) → utf-16 round-trip 으로 합치기.
-    둘 다 실패해도 원본 그대로 반환 (안전 fallback).
+    3) 짝 안 맞는 unpaired surrogate → U+FFFD 로 치환 (UTF-8 안전).
+
+    어떤 경우에도 결과는 UTF-8 인코딩 안전 — 호출자의 write_text 가
+    UnicodeEncodeError 로 깨지지 않도록 보장.
     """
     fixed = _SURROGATE_PAIR_LITERAL_RE.sub(_join_surrogate_pair, text)
     try:
-        return fixed.encode("utf-16", "surrogatepass").decode("utf-16")
+        fixed = fixed.encode("utf-16", "surrogatepass").decode("utf-16")
     except UnicodeDecodeError:
-        return fixed
+        pass  # 다음 단계에서 unpaired surrogate 를 replace 로 처리.
+    # 최종 안전망: UTF-8 인코딩 가능한 형태로 normalize.
+    return fixed.encode("utf-8", "replace").decode("utf-8")
 
 
 class WorkspaceError(Exception):

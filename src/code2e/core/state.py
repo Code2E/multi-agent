@@ -16,16 +16,25 @@ from code2e.core.schemas import SystemState
 _SLUG_WORD_RE = re.compile(r"[a-zA-Z]+")
 _SLUG_MAX_WORDS = 4
 _SLUG_MAX_LEN = 30
+# 일반적인 영어 stop words. slug 식별력을 떨어뜨리므로 제외.
+_SLUG_STOP_WORDS = frozenset(
+    {"a", "an", "the", "in", "on", "at", "of", "to", "for", "and", "or", "with", "by"}
+)
 
 
 def slugify_task(task: str) -> str | None:
-    """task 입력에서 첫 N 개 영어 단어를 추출해 slug 화.
+    """task 입력에서 첫 N 개 의미 있는 영어 단어를 추출해 slug 화.
 
     - 한국어/특수문자만 있는 입력 → None (호출자가 fallback 형식 사용)
+    - stop words ("the", "in", "of" 등) 제외 → 식별력 ↑
     - kebab-case, 소문자, 최대 4 단어 / 30 자
     """
     words = _SLUG_WORD_RE.findall(task)
-    meaningful = [w.lower() for w in words if len(w) >= 2]
+    meaningful = [
+        w.lower()
+        for w in words
+        if len(w) >= 2 and w.lower() not in _SLUG_STOP_WORDS
+    ]
     if not meaningful:
         return None
     selected = meaningful[:_SLUG_MAX_WORDS]
@@ -34,7 +43,12 @@ def slugify_task(task: str) -> str | None:
 
 
 def new_run_id(slug: str | None = None) -> str:
-    """slug 있으면 r_<slug>_<unix>, 없으면 r_<unix>_<rand4>."""
+    """slug 있으면 r_<slug>_<unix>, 없으면 r_<unix>_<rand4>.
+
+    주의: slug 모드에서 같은 slug + 같은 초에 두 번 호출 시 id 충돌 가능.
+    v4 Q19 의 runs/.global.lock 이 동시 run 을 막아 실질 위험은 없지만,
+    배치 자동화 도구가 직접 new_run_id 를 빠르게 두 번 호출하면 발생할 수 있음.
+    """
     if slug:
         return f"r_{slug}_{int(time.time())}"
     return f"r_{int(time.time())}_{secrets.token_hex(2)}"

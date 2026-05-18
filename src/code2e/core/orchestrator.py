@@ -18,6 +18,7 @@ DECISION: Q39 — 실패 리포트 raw + 길면 헤드/테일 5KB 씩 컷 (10KB 
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import sys
 from collections.abc import Awaitable, Callable
@@ -569,11 +570,20 @@ class Orchestrator:
         workspace_dir.mkdir(parents=True, exist_ok=True)
 
         command = list(spec.command)
-        if command and command[0] in ("python", "python3"):
-            command[0] = sys.executable
+        if command:
+            # basename 비교로 python / python3 / python3.12 / /usr/bin/python 등
+            # 다양한 표기를 모두 잡아 sys.executable (code2e venv 인터프리터) 로 치환.
+            base = Path(command[0]).name
+            if base in ("python", "python3") or base.startswith("python3."):
+                command[0] = sys.executable
 
+        # sh -c "uvicorn ..." 같은 명령은 command[0] 치환 대상 아님. 대신 PATH 앞에
+        # code2e venv bin 을 박아 호스트의 다른 uvicorn 이 잡히지 않도록 강제.
+        venv_bin = str(Path(sys.executable).parent)
+        host_path = os.environ.get("PATH", "")
         launch_env: dict[str, str] = {
             **spec.env,
+            "PATH": f"{venv_bin}:{host_path}" if host_path else venv_bin,
             "VIRTUAL_ENV": "",
             "PYTHONHOME": "",
             "PYTHONPATH": "",
@@ -966,7 +976,12 @@ def _pick_target_unit(
     tie 해결: all_units (topological_sort 순서) 의 앞쪽 unit 우선. 매핑이 전부
     실패하거나 plan_unit_refs 가 비어 있으면 fallback (= 첫 unit).
     """
-    failed_case_ids = {r.case_id for r in run.results if r.status != "passed"}
+    # status 종류: passed / failed / errored / skipped.
+    # skipped 는 의도적 스킵 (예: 환경 미충족) — Executor 가 fix 시도해도 의미 없음.
+    # failed / errored 만 fix 대상.
+    failed_case_ids = {
+        r.case_id for r in run.results if r.status in ("failed", "errored")
+    }
     if not failed_case_ids:
         return fallback
 
@@ -991,11 +1006,15 @@ def _pick_target_unit(
     return fallback
 
 
+# case-insensitive: 도메인 / 프레임워크 키워드.
 _HTTP_TASK_KEYWORDS = re.compile(
     r"\b(api|rest|server|endpoint|http|fastapi|flask|django|uvicorn|"
-    r"webhook|microservice|backend|/health|/todos|GET\s|POST\s|PUT\s|DELETE\s)\b",
+    r"webhook|microservice|backend|/health|/todos)\b",
     re.IGNORECASE,
 )
+# case-sensitive: HTTP 메서드 (대문자 또는 path 와 결합) — "get a coffee" 같은
+# 평문에서 false positive 방지.
+_HTTP_METHOD_RE = re.compile(r"\b(GET|POST|PUT|DELETE|PATCH)\s")
 
 
 def _looks_like_http_task(user_input: str) -> bool:
@@ -1004,8 +1023,11 @@ def _looks_like_http_task(user_input: str) -> bool:
     *생성* 휴리스틱 (LaunchSpec 추론) 이 아니라 *진단* 휴리스틱 (launch_spec 누락이
     실수인지 의도인지 판별). Q41 의 비목표 영역과 충돌하지 않음.
     false positive 는 가능하지만 false negative 는 피하도록 키워드 넉넉히 잡음.
+    HTTP 메서드는 대문자만 매칭해 일상 영어 (get / put / post) 와 분리.
     """
-    return bool(_HTTP_TASK_KEYWORDS.search(user_input))
+    return bool(
+        _HTTP_TASK_KEYWORDS.search(user_input) or _HTTP_METHOD_RE.search(user_input)
+    )
 
 
 def _tail_log(log_path: str, n: int = 15) -> str:
@@ -1014,15 +1036,21 @@ def _tail_log(log_path: str, n: int = 15) -> str:
     Phase L abort 시 진단 자동화용. uvicorn 의 "Running on http://..." / Python
     traceback / "Address already in use" 같은 결정적 단서가 마지막 영역에 모이는
     경향이라 tail 만으로도 80% 케이스 진단 가능.
+
+    구현: deque(maxlen=n) 으로 스트리밍 — 로그가 수십 MB 이상이어도 메모리는
+    마지막 N 줄 분량만 사용 (runs/app-logs/stdout.log 가 모든 run 공유라 장기
+    누적 가능성 존재).
     """
+    from collections import deque
+
     try:
         with open(log_path, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except (OSError, FileNotFoundError):
+            lines = deque(f, maxlen=n)
+    except OSError:
         return "(log unavailable)"
     if not lines:
         return "(log empty)"
-    return "".join(lines[-n:]).rstrip()
+    return "".join(lines).rstrip()
 
 
 def _parse_yaml_dict(yaml_text: str) -> dict[str, object] | None:
