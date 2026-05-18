@@ -551,6 +551,45 @@ class Orchestrator:
             EvaluatorTestgenInput(final_plan=state.plan.final), ctx
         )
 
+    def _build_launch_spec(
+        self, spec: LaunchSpec, run_id: str, port: int | None
+    ) -> LaunchSpec:
+        """LaunchSpec 에 환경 독립 override 적용 (Phase L + Phase 3 restart 공통).
+
+        - cwd: workspace dir (LLM 은 run_id 를 모르므로 직접 작성 불가)
+        - command[0] "python"/"python3" → sys.executable (code2e venv 인터프리터)
+        - env: VIRTUAL_ENV / PYTHONHOME / PYTHONPATH 호스트 누출 차단 + PORT 주입
+        - port_hint: 할당 포트 박음 (ProcessManager 가 base_url 구성)
+
+        주의: Phase 3 restart 가 이 헬퍼를 거치지 않으면 PORT env 가 빈 문자열로
+        평가돼 `sh -c "uvicorn ... --port $PORT"` 같은 셸 치환이 깨짐 (실제 버그
+        사례 확인됨).
+        """
+        workspace_dir = (self.workspace_root or Path(".")) / run_id
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+
+        command = list(spec.command)
+        if command and command[0] in ("python", "python3"):
+            command[0] = sys.executable
+
+        launch_env: dict[str, str] = {
+            **spec.env,
+            "VIRTUAL_ENV": "",
+            "PYTHONHOME": "",
+            "PYTHONPATH": "",
+        }
+        if port is not None:
+            launch_env["PORT"] = str(port)
+
+        overrides: dict[str, object] = {
+            "cwd": str(workspace_dir),
+            "command": command,
+            "env": launch_env,
+        }
+        if port is not None:
+            overrides["port_hint"] = port
+        return spec.model_copy(update=overrides)
+
     async def _run_launching(self, state: SystemState) -> SystemState:
         """Phase L: PortAllocator.acquire + ProcessManager.launch + health-check (v4 §6.1, §9).
 
@@ -596,39 +635,9 @@ class Orchestrator:
                     "config.generated_app.port_range 변경",
                 )
 
-        # 2) launch: cwd / command / env 를 환경 독립적으로 주입.
-        #    - cwd: workspace dir (LLM 은 run_id 를 모르므로 직접 작성 불가)
-        #    - command[0] "python"/"python3" → sys.executable (code2e venv 의 인터프리터).
-        #      호스트 PATH 의 python 이 어떤 인터프리터일지 결정적이지 않으므로 명시적으로 박음.
-        #      산출 앱 의 런타임 deps (fastapi / uvicorn 등) 는 demo extra 로 venv 에 동봉.
-        #    - env: host VIRTUAL_ENV / PYTHONHOME / PYTHONPATH 누출 차단.
-        #      ProcessManager 가 {**os.environ, **spec.env} 로 merge 하므로 빈 문자열로 덮어쓰기.
-        #      PYTHONPATH 는 code2e 의 src 가 박혀 있어 산출 앱에 누출되면 import 충돌 가능.
-        #    - PORT: 할당된 포트를 env 로 전달 (planner 프롬프트가 이걸 읽도록 안내).
-        workspace_dir = (self.workspace_root or Path(".")) / state.run_id
-        workspace_dir.mkdir(parents=True, exist_ok=True)
-
-        command = list(spec.command)
-        if command and command[0] in ("python", "python3"):
-            command[0] = sys.executable
-
-        launch_env: dict[str, str] = {
-            **spec.env,
-            "VIRTUAL_ENV": "",
-            "PYTHONHOME": "",
-            "PYTHONPATH": "",
-        }
-        if port is not None:
-            launch_env["PORT"] = str(port)
-
-        spec_overrides: dict[str, object] = {
-            "cwd": str(workspace_dir),
-            "command": command,
-            "env": launch_env,
-        }
-        if port is not None:
-            spec_overrides["port_hint"] = port
-        spec_with_overrides = spec.model_copy(update=spec_overrides)
+        # 2) launch: cwd / command / env 를 환경 독립적으로 주입. _build_launch_spec
+        #    헬퍼 (Phase 3 restart 도 동일 override 필요 — 안 그러면 PORT env 누락).
+        spec_with_overrides = self._build_launch_spec(spec, state.run_id, port)
         info = await self.process_manager.launch(spec_with_overrides)
 
         # 3) health check (startup_timeout_s 동안 polling).
@@ -852,9 +861,10 @@ class Orchestrator:
                     )
 
                 # 7) process restart (Q42 항상 재기동).
+                #    Phase L 과 동일한 launch spec override 적용 — PORT env 누락 방지.
                 if self.process_manager is not None and state.plan.launch_spec is not None:
-                    spec = state.plan.launch_spec.model_copy(
-                        update={"port_hint": launch_info.port}
+                    spec = self._build_launch_spec(
+                        state.plan.launch_spec, state.run_id, launch_info.port
                     )
                     new_info = await self.process_manager.restart(spec, launch_info)
                     ok = await self.process_manager.health_check(
@@ -863,20 +873,25 @@ class Orchestrator:
                         timeout_s=spec.startup_timeout_s,
                     )
                     if not ok:
+                        log_tail = _tail_log(new_info.log_path, n=15)
                         return self._abort_phase3(
                             state,
                             runs,
                             "LAUNCH_TIMEOUT",
-                            "restart 후 산출물 health 미통과",
-                            f"tail {new_info.log_path}",
+                            f"restart 후 산출물 health 미통과 "
+                            f"(expected port={launch_info.port}).\n"
+                            f"--- last log lines ---\n{log_tail}",
+                            f"전체 로그: tail {new_info.log_path}",
                         )
                     if not await self.process_manager.is_alive(new_info):
+                        log_tail = _tail_log(new_info.log_path, n=15)
                         return self._abort_phase3(
                             state,
                             runs,
                             "APP_CRASHED",
-                            "restart 후 산출물 즉시 비정상 종료",
-                            f"tail {new_info.log_path}",
+                            f"restart 후 산출물 즉시 비정상 종료.\n"
+                            f"--- last log lines ---\n{log_tail}",
+                            f"전체 로그: tail {new_info.log_path}",
                         )
                     new_info = new_info.model_copy(update={"healthy_at": datetime.now(UTC)})
                     launch_info = new_info
