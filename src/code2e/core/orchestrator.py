@@ -979,6 +979,14 @@ class Orchestrator:
                         "Executor repair 소진",
                         "code2e inspect <run_id> 의 agent-outputs/executor 확인",
                     )
+                except BudgetExceededError as e:
+                    return self._abort_phase3(
+                        state,
+                        runs,
+                        "BUDGET_EXCEEDED",
+                        f"Phase 3 Executor revise 중 한도 초과: {e}",
+                        "config.budget 조정 또는 cassette mode=replay 사용",
+                    )
 
                 # 6) workspace 적용.
                 try:
